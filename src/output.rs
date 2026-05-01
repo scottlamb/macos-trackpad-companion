@@ -17,7 +17,8 @@ use core_foundation_sys::runloop::{
     CFRunLoopAddTimer, CFRunLoopTimerContext, CFRunLoopTimerCreate, CFRunLoopTimerInvalidate,
     CFRunLoopTimerRef,
 };
-use core_graphics::geometry::CGPoint;
+use core_graphics::display::CGDisplay;
+use core_graphics::geometry::{CGPoint, CGRect};
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
@@ -80,6 +81,19 @@ const SCROLL_CURVE_EXPONENT: f64 = 1.3;
 /// equals `scroll_accel × velocity`; ~1 mm per chip frame on a 60 Hz
 /// pad, which feels "typical" to the user during deliberate panning.
 const SCROLL_CURVE_REF_MM_PER_SEC: f64 = 60.0;
+
+/// Bounds of the display containing `point`, falling back to the main
+/// display if the point isn't on any (e.g. just past a screen edge —
+/// which is exactly the case we're trying to clamp against). Used by
+/// `move_cursor_by` to keep posted event locations on-screen.
+fn display_bounds_for(point: CGPoint) -> CGRect {
+    if let Ok((ids, _)) = CGDisplay::displays_with_point(point, 1) {
+        if let Some(&id) = ids.first() {
+            return CGDisplay::new(id).bounds();
+        }
+    }
+    CGDisplay::main().bounds()
+}
 
 /// Apply the scroll-acceleration curve to a velocity, returning pixels
 /// per second. Caller multiplies by per-tick `dt` for the per-tick
@@ -429,9 +443,22 @@ impl Emitter {
     pub fn move_cursor_by(&self, dx_mm: f64, dy_mm: f64) {
         let dx = dx_mm * self.cfg.accel;
         let dy = dy_mm * self.cfg.accel;
-        let mut p = self.cursor();
+        let from = self.cursor();
+        let mut p = from;
         p.x += dx;
         p.y += dy;
+        // Clamp the *event location* to the bounds of the display the cursor
+        // started on. The auto-hidden full-screen menu bar reveals only while
+        // the cursor sits at the menu-bar display's top edge (y == origin.y);
+        // a real input device hits that edge naturally because the OS won't
+        // let it leave the screen, but a CGEvent posted at y < origin.y just
+        // visually clamps the cursor without firing the reveal. The same
+        // logic applies to Dock auto-reveal at the bottom edge. Delta fields
+        // below stay at the user's requested value so apps see "pushing past
+        // the edge" intent.
+        let bounds = display_bounds_for(from);
+        p.x = p.x.clamp(bounds.origin.x, bounds.origin.x + bounds.size.width - 1.0);
+        p.y = p.y.clamp(bounds.origin.y, bounds.origin.y + bounds.size.height - 1.0);
         let Some(e) = Event::from_raw(unsafe {
             CGEventCreateMouseEvent(std::ptr::null_mut(), kCGEventMouseMoved, p, kCGMouseButtonLeft)
         }) else {
