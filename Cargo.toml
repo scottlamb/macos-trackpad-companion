@@ -1,0 +1,25 @@
+[package]
+name = "magic-trackpad-companion"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "companion"
+path = "src/main.rs"
+
+[dependencies]
+core-foundation     = "0.10"
+core-foundation-sys = "0.8"
+core-graphics       = "0.25"
+io-kit-sys          = "0.5"
+libc                = "0.2"
+log                 = "0.4"
+env_logger          = "0.11"
+anyhow              = "1"
+clap                = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = "fat"
+opt-level = 3
+debug = 1
