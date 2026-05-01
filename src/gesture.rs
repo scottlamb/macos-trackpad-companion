@@ -250,6 +250,14 @@ impl<O: Output> State<O> {
         let dx = tr.x - tr.prev_x;
         let dy = tr.y - tr.prev_y;
         if dx.abs() > MOTION_DEAD_ZONE || dy.abs() > MOTION_DEAD_ZONE {
+            log::debug!(
+                "cursor id={} norm_d=({:+.4},{:+.4}) raw=({},{})",
+                c.id,
+                dx,
+                dy,
+                c.raw_x,
+                c.raw_y,
+            );
             self.out.move_cursor_by(dx, dy);
         }
     }
@@ -301,6 +309,7 @@ impl<O: Output> State<O> {
                 let ddx = centroid.0 - base.last_centroid.0;
                 let ddy = centroid.1 - base.last_centroid.1;
                 if ddx.abs() > MOTION_DEAD_ZONE || ddy.abs() > MOTION_DEAD_ZONE {
+                    log::debug!("scroll norm_d=({:+.4},{:+.4})", ddx, ddy);
                     self.out.scroll(ddx, ddy, Phase::Changed);
                 }
             }
@@ -421,6 +430,8 @@ mod tests {
                     id,
                     x,
                     y,
+                    raw_x: 0,
+                    raw_y: 0,
                     tip: true,
                     confidence: true,
                 })

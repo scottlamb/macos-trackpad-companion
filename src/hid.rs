@@ -303,6 +303,8 @@ unsafe extern "C" fn on_device_matched(
     let bridge = unsafe { &mut *(context as *mut Bridge) };
 
     let product = read_string_property(device, KEY_PRODUCT).unwrap_or_else(|| "<unknown>".into());
+    let vid = read_number_property(device, KEY_VENDOR_ID);
+    let pid = read_number_property(device, KEY_PRODUCT_ID);
     let desc = match read_data_property(device, KEY_REPORT_DESCRIPTOR) {
         Some(d) => d,
         None => {
@@ -313,16 +315,34 @@ unsafe extern "C" fn on_device_matched(
     let layout = match descriptor::parse(&desc) {
         Ok(l) => l,
         Err(e) => {
-            log::warn!("matched \"{product}\" but descriptor parse failed: {e:#}");
+            log::warn!(
+                "matched \"{product}\" but descriptor parse failed: {e:#}; descriptor was {} bytes",
+                desc.len()
+            );
             return;
         }
     };
     log::info!(
-        "matched \"{product}\": {} contacts, logical {}×{}, payload {} bytes",
+        "matched \"{product}\" (vid={} pid={}): {} contacts, logical max {}×{}, \
+         {} bytes/contact, payload {} bytes total",
+        vid.map(|v| format!("{:#06x}", v as u16)).unwrap_or_else(|| "?".into()),
+        pid.map(|v| format!("{:#06x}", v as u16)).unwrap_or_else(|| "?".into()),
         layout.contact_slots,
         layout.logical_x_max,
         layout.logical_y_max,
-        layout.total_payload_bytes
+        layout.bytes_per_contact,
+        layout.total_payload_bytes,
+    );
+    log::info!(
+        "  layout offsets: report_id=0x{:02x} fingers@{} scan_time@{} contact_count@{} \
+         button@{} bit{} (descriptor: {} bytes)",
+        layout.report_id,
+        layout.fingers_offset,
+        layout.scan_time_offset,
+        layout.contact_count_offset,
+        layout.button_offset,
+        layout.button_bit,
+        desc.len(),
     );
 
     let buf_len = layout.total_payload_bytes.max(64);
@@ -410,10 +430,47 @@ unsafe extern "C" fn on_input_report(
     let state = unsafe { &mut *(context as *mut DeviceState) };
     let bridge = unsafe { &mut *state.bridge };
     let bytes = unsafe { std::slice::from_raw_parts(report, report_length as usize) };
+    if log::log_enabled!(log::Level::Trace) {
+        log::trace!("input report ({} bytes): {}", bytes.len(), hex(bytes));
+    }
     let Some(frame) = report::decode(&state.layout, bytes) else {
+        log::debug!("decode failed for {}-byte report", bytes.len());
         return;
     };
+    if log::log_enabled!(log::Level::Trace) {
+        log::trace!(
+            "  frame: contact_count={} scan_time={} button={} contacts={:?}",
+            frame.contacts.len(),
+            frame.scan_time_100us,
+            frame.button,
+            frame.contacts,
+        );
+    } else if log::log_enabled!(log::Level::Debug) && let Some(c) = frame.contacts.first() {
+        log::debug!(
+            "frame n={} c0 id={} raw=({:>4},{:>4}) norm=({:.3},{:.3}) tip={} button={}",
+            frame.contacts.len(),
+            c.id,
+            c.raw_x,
+            c.raw_y,
+            c.x,
+            c.y,
+            c.tip,
+            frame.button,
+        );
+    }
     (bridge.on_frame)(frame);
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && i % 4 == 0 {
+            s.push(' ');
+        }
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 fn build_match_dict(filter: &Filter) -> CFDictionary<CFString, CFType> {
@@ -459,4 +516,14 @@ fn read_data_property(device: IOHIDDeviceRef, key: &str) -> Option<Vec<u8>> {
     }
     let cfd: CFData = unsafe { CFData::wrap_under_get_rule(raw as *const _) };
     Some(cfd.bytes().to_vec())
+}
+
+fn read_number_property(device: IOHIDDeviceRef, key: &str) -> Option<i32> {
+    let cfkey = CFString::new(key);
+    let raw = unsafe { IOHIDDeviceGetProperty(device, cfkey.as_concrete_TypeRef() as *const _) };
+    if raw.is_null() {
+        return None;
+    }
+    let n: CFNumber = unsafe { CFNumber::wrap_under_get_rule(raw as *const _) };
+    n.to_i32()
 }

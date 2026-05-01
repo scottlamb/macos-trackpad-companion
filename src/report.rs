@@ -13,6 +13,13 @@ pub struct Contact {
     pub x: f64,
     /// Normalized Y in [0.0, 1.0] (top → bottom; PTP origin is top-left).
     pub y: f64,
+    /// Raw chip-unit X straight from the report. Kept alongside the
+    /// normalized value so logging / tests can see what the firmware
+    /// actually emitted vs. what we computed; load-bearing for diagnosing
+    /// descriptor logical-max mismatches (firmware says max=1023 but
+    /// chip emits 0..2047 → normalized clamps and cursor stalls).
+    pub raw_x: u16,
+    pub raw_y: u16,
     pub tip: bool,
     pub confidence: bool,
 }
@@ -57,6 +64,8 @@ pub fn decode(layout: &Layout, report: &[u8]) -> Option<Frame> {
             id,
             x: nx.clamp(0.0, 1.0),
             y: ny.clamp(0.0, 1.0),
+            raw_x: x as u16,
+            raw_y: y as u16,
             tip,
             confidence,
         });
