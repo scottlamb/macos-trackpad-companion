@@ -35,12 +35,14 @@ struct Args {
     #[arg(long)]
     no_private_gestures: bool,
 
-    /// Cursor pixels per logical normalized unit. Higher = faster cursor.
-    #[arg(long, default_value_t = 1500.0)]
+    /// Screen pixels per millimeter of finger motion. Higher = faster
+    /// cursor. Independent of pad density; ~25 matches the old default's
+    /// feel on a 65 mm-wide pad.
+    #[arg(long, default_value_t = 25.0)]
     accel: f64,
 
-    /// Scroll pixels per logical normalized unit.
-    #[arg(long, default_value_t = 1200.0)]
+    /// Screen pixels per millimeter of finger motion in scroll mode.
+    #[arg(long, default_value_t = 20.0)]
     scroll_accel: f64,
 
     /// Verbose logging. Repeat for trace-level (-vv).

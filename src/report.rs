@@ -1,7 +1,8 @@
 //! Decode a PTP touch input report (ID 0x01) using a [`Layout`] from
-//! [`crate::descriptor::parse`]. Coordinates are normalized to [0,1]
-//! using the descriptor's logical max so downstream gesture code is
-//! firmware-agnostic.
+//! [`crate::descriptor::parse`]. Coordinates are converted from chip
+//! pixels to millimeters using the descriptor's per-axis density
+//! ([`Layout::mm_per_logical_px_x`] / `_y`) so downstream gesture code
+//! works in physical units and is firmware-agnostic.
 
 use crate::descriptor::Layout;
 
@@ -9,17 +10,10 @@ use crate::descriptor::Layout;
 #[allow(dead_code)]
 pub struct Contact {
     pub id: u8,
-    /// Normalized X in [0.0, 1.0] (left → right).
+    /// X position in millimeters (left → right).
     pub x: f64,
-    /// Normalized Y in [0.0, 1.0] (top → bottom; PTP origin is top-left).
+    /// Y position in millimeters (top → bottom; PTP origin is top-left).
     pub y: f64,
-    /// Raw chip-unit X straight from the report. Kept alongside the
-    /// normalized value so logging / tests can see what the firmware
-    /// actually emitted vs. what we computed; load-bearing for diagnosing
-    /// descriptor logical-max mismatches (firmware says max=1023 but
-    /// chip emits 0..2047 → normalized clamps and cursor stalls).
-    pub raw_x: u16,
-    pub raw_y: u16,
     pub tip: bool,
     pub confidence: bool,
 }
@@ -43,6 +37,9 @@ pub fn decode(layout: &Layout, report: &[u8]) -> Option<Frame> {
     let contact_count = report[layout.contact_count_offset] as usize;
     let n = contact_count.min(layout.contact_slots);
 
+    let mm_per_px_x = layout.mm_per_logical_px_x();
+    let mm_per_px_y = layout.mm_per_logical_px_y();
+
     let mut contacts = Vec::with_capacity(n);
     for i in 0..n {
         let off = layout.fingers_offset + i * layout.bytes_per_contact;
@@ -57,15 +54,10 @@ pub fn decode(layout: &Layout, report: &[u8]) -> Option<Frame> {
         let confidence = (flags & 0x01) != 0;
         let tip = (flags & 0x02) != 0;
 
-        let nx = (x as f64) / layout.logical_x_max.max(1) as f64;
-        let ny = (y as f64) / layout.logical_y_max.max(1) as f64;
-
         contacts.push(Contact {
             id,
-            x: nx.clamp(0.0, 1.0),
-            y: ny.clamp(0.0, 1.0),
-            raw_x: x as u16,
-            raw_y: y as u16,
+            x: (x as f64) * mm_per_px_x,
+            y: (y as f64) * mm_per_px_y,
             tip,
             confidence,
         });
@@ -101,6 +93,8 @@ mod tests {
             button_bit: 0,
             logical_x_max: 3936,
             logical_y_max: 2424,
+            physical_x_max_mm: 65.0,
+            physical_y_max_mm: 40.0,
             total_payload_bytes: 35,
         }
     }
@@ -110,7 +104,7 @@ mod tests {
         let layout = fake_layout();
         let mut buf = vec![0u8; 35];
         buf[0] = 0x01;
-        // Contact 0: tip=1, conf=1, id=7, x=1968, y=1212
+        // Contact 0: tip=1, conf=1, id=7, x=1968, y=1212 (pad midpoint)
         buf[1] = 0x03;
         buf[2] = 7;
         buf[3..5].copy_from_slice(&1968u16.to_le_bytes());
@@ -128,8 +122,9 @@ mod tests {
         let frame = decode(&layout, &buf).expect("decode");
         assert_eq!(frame.contacts.len(), 2);
         assert_eq!(frame.contacts[0].id, 7);
-        assert!((frame.contacts[0].x - 0.5).abs() < 0.001);
-        assert!((frame.contacts[0].y - 0.5).abs() < 0.001);
+        // Midpoint chip pixel → midpoint mm.
+        assert!((frame.contacts[0].x - 32.5).abs() < 0.05, "{}", frame.contacts[0].x);
+        assert!((frame.contacts[0].y - 20.0).abs() < 0.05, "{}", frame.contacts[0].y);
         assert_eq!(frame.scan_time_100us, 0x1234);
         assert!(frame.button);
     }

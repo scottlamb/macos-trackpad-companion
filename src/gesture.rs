@@ -11,24 +11,32 @@ use crate::report::{Contact, Frame};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-// ---- Tunables (all in normalized [0,1] coord space) ----
+// ---- Tunables ----
+//
+// Distance thresholds are in physical millimeters. They translate
+// directly across pads of any density / aspect ratio because contacts
+// arrive in mm (the decoder applies per-axis chip-px → mm scaling
+// using `Layout::physical_*_max_mm`). Numbers are calibrated to human
+// finger ergonomics, not pad fractions.
 
-/// Max movement during a touch for it to count as a tap.
-const TAP_MAX_MOVE: f64 = 0.012;
+/// Max distance a contact may drift from its landing point during a
+/// short touch and still count as a tap. ~1 mm covers normal finger
+/// jitter without admitting deliberate cursor moves.
+const TAP_MAX_MOVE_MM: f64 = 1.0;
 /// Max touch duration to count as a tap.
 const TAP_MAX_DURATION: Duration = Duration::from_millis(220);
-/// Centroid motion below this between frames is considered jitter.
-const MOTION_DEAD_ZONE: f64 = 0.0005;
+/// Centroid motion below this between frames is treated as jitter.
+const MOTION_DEAD_ZONE_MM: f64 = 0.04;
 
-/// Centroid pan distance (normalized) needed to lock 2F mode = pan.
-const PAN_LOCK: f64 = 0.005;
-/// Distance-change ratio needed to lock 2F mode = pinch.
+/// Centroid pan distance needed to lock 2F mode = pan.
+const PAN_LOCK_MM: f64 = 0.4;
+/// Distance-change ratio needed to lock 2F mode = pinch (unitless).
 const PINCH_LOCK_RATIO: f64 = 0.04;
 /// Angle change (radians) needed to lock 2F mode = rotate.
 const ROTATE_LOCK_RAD: f64 = 6.0_f64 * std::f64::consts::PI / 180.0;
 
 /// Centroid travel needed to fire a 3F or 4F swipe.
-const SWIPE_TRIGGER: f64 = 0.06;
+const SWIPE_TRIGGER_MM: f64 = 5.0;
 
 #[derive(Clone, Copy, Debug)]
 struct Tracked {
@@ -196,9 +204,9 @@ impl<O: Output> State<O> {
                 if matches!(new_kind, GestureKind::Idle) {
                     let dur = now - self.started_at;
                     let max_move = self.max_move_sq.sqrt();
-                    if dur < TAP_MAX_DURATION && max_move < TAP_MAX_MOVE {
+                    if dur < TAP_MAX_DURATION && max_move < TAP_MAX_MOVE_MM {
                         log::debug!(
-                            "1f tap: click Left (dur={}ms max_move={:.4}{})",
+                            "1f tap: click Left (dur={}ms max_move={:.2}mm{})",
                             dur.as_millis(),
                             max_move,
                             if dropped.is_some() { ", dropped lift-frame motion" } else { "" },
@@ -206,11 +214,11 @@ impl<O: Output> State<O> {
                         self.out.click(MouseButton::Left);
                     } else {
                         log::debug!(
-                            "1f lift, no tap: dur={}ms max_move={:.4} (limits dur<{}ms move<{:.4})",
+                            "1f lift, no tap: dur={}ms max_move={:.2}mm (limits dur<{}ms move<{:.2}mm)",
                             dur.as_millis(),
                             max_move,
                             TAP_MAX_DURATION.as_millis(),
-                            TAP_MAX_MOVE,
+                            TAP_MAX_MOVE_MM,
                         );
                     }
                 }
@@ -231,16 +239,16 @@ impl<O: Output> State<O> {
                 if matches!(new_kind, GestureKind::Idle) {
                     let dur = now - self.started_at;
                     let max_move = self.max_move_sq.sqrt();
-                    if dur < TAP_MAX_DURATION && max_move < TAP_MAX_MOVE {
+                    if dur < TAP_MAX_DURATION && max_move < TAP_MAX_MOVE_MM {
                         log::debug!(
-                            "2f tap: click Right (dur={}ms max_move={:.4})",
+                            "2f tap: click Right (dur={}ms max_move={:.2}mm)",
                             dur.as_millis(),
                             max_move,
                         );
                         self.out.click(MouseButton::Right);
                     } else {
                         log::debug!(
-                            "2f lift, no tap: dur={}ms max_move={:.4}",
+                            "2f lift, no tap: dur={}ms max_move={:.2}mm",
                             dur.as_millis(),
                             max_move,
                         );
@@ -310,10 +318,10 @@ impl<O: Output> State<O> {
         // the centroid-shift jump that capacitive trackpads commonly
         // report on the last with-finger frame.
         if let Some((bdx, bdy)) = self.pending_motion.take() {
-            if bdx.abs() > MOTION_DEAD_ZONE || bdy.abs() > MOTION_DEAD_ZONE {
+            if bdx.abs() > MOTION_DEAD_ZONE_MM || bdy.abs() > MOTION_DEAD_ZONE_MM {
                 log::debug!(
-                    "cursor: emit deferred d=({:+.4},{:+.4}) (cur frame raw=({},{}))",
-                    bdx, bdy, c.raw_x, c.raw_y,
+                    "cursor: emit deferred d=({:+.3},{:+.3})mm (cur frame at=({:.2},{:.2})mm)",
+                    bdx, bdy, c.x, c.y,
                 );
                 self.out.move_cursor_by(bdx, bdy);
             }
@@ -341,7 +349,7 @@ impl<O: Output> State<O> {
             let pan = ((centroid.0 - base.initial_centroid.0).powi(2)
                 + (centroid.1 - base.initial_centroid.1).powi(2))
             .sqrt()
-                / PAN_LOCK;
+                / PAN_LOCK_MM;
             let pinch = (dist / base.initial_distance - 1.0).abs() / PINCH_LOCK_RATIO;
             let rot = angle_delta(ang, base.initial_angle).abs() / ROTATE_LOCK_RAD;
             if pan >= 1.0 || pinch >= 1.0 || rot >= 1.0 {
@@ -376,8 +384,8 @@ impl<O: Output> State<O> {
             GestureKind::TwoFingerPan => {
                 let ddx = centroid.0 - base.last_centroid.0;
                 let ddy = centroid.1 - base.last_centroid.1;
-                if ddx.abs() > MOTION_DEAD_ZONE || ddy.abs() > MOTION_DEAD_ZONE {
-                    log::debug!("scroll: d=({:+.4},{:+.4})", ddx, ddy);
+                if ddx.abs() > MOTION_DEAD_ZONE_MM || ddy.abs() > MOTION_DEAD_ZONE_MM {
+                    log::debug!("scroll: d=({:+.3},{:+.3})mm", ddx, ddy);
                     self.out.scroll(ddx, ddy, Phase::Changed);
                 }
             }
@@ -415,16 +423,16 @@ impl<O: Output> State<O> {
         let dy = cy - base.initial_centroid.1;
 
         let dir = if dx.abs() >= dy.abs() {
-            if dx >= SWIPE_TRIGGER {
+            if dx >= SWIPE_TRIGGER_MM {
                 Some(SwipeDirection::Right)
-            } else if dx <= -SWIPE_TRIGGER {
+            } else if dx <= -SWIPE_TRIGGER_MM {
                 Some(SwipeDirection::Left)
             } else {
                 None
             }
-        } else if dy >= SWIPE_TRIGGER {
+        } else if dy >= SWIPE_TRIGGER_MM {
             Some(SwipeDirection::Down)
-        } else if dy <= -SWIPE_TRIGGER {
+        } else if dy <= -SWIPE_TRIGGER_MM {
             Some(SwipeDirection::Up)
         } else {
             None
@@ -432,7 +440,7 @@ impl<O: Output> State<O> {
 
         if let Some(direction) = dir {
             log::debug!(
-                "swipe: {:?} (n_fingers={} centroid_d=({:+.4},{:+.4}))",
+                "swipe: {:?} (n_fingers={} centroid_d=({:+.2},{:+.2})mm)",
                 direction,
                 active.len(),
                 dx,
@@ -499,16 +507,24 @@ mod tests {
         }
     }
 
+    /// Tests pre-date the chip-px → mm migration: their coordinates are
+    /// expressed as [0,1] fractions of a notional pad. The helper scales
+    /// them onto a square 50 × 50 mm "test pad" so the engine sees the
+    /// physical units it now expects. 50 mm is roughly the X dimension
+    /// of the SoflePLUS2 (49 mm) and gives sensible mm budgets for the
+    /// `0.001`-level deltas in tests like `pre_scroll_two_finger_settling`
+    /// (~0.05 mm) and `lift_suppresses_prior_frame_centroid_shift_jump`
+    /// (~0.25 mm normal motion vs. 2.5 mm lift jump).
+    const TEST_PAD_MM: f64 = 50.0;
+
     fn frame(contacts: &[(u8, f64, f64)]) -> Frame {
         Frame {
             contacts: contacts
                 .iter()
-                .map(|&(id, x, y)| Contact {
+                .map(|&(id, nx, ny)| Contact {
                     id,
-                    x,
-                    y,
-                    raw_x: 0,
-                    raw_y: 0,
+                    x: nx * TEST_PAD_MM,
+                    y: ny * TEST_PAD_MM,
                     tip: true,
                     confidence: true,
                 })
@@ -615,15 +631,16 @@ mod tests {
     // ── Scenarios ported from rmk's TrackpadProcessor tests ──
     //
     // These mirror the chip-side trackpad processor's behavioural
-    // expectations, translated into normalized [0,1] coordinates and the
-    // gesture-engine's coarser-grained API. Some are aspirational — they
-    // describe behaviour the chip-side processor has but this engine still
-    // lacks. Those are marked `#[ignore]` with a comment naming the gap.
+    // expectations, expressed via the same `frame()` helper (so the [0,1]
+    // values get scaled onto the 50 mm test pad). Some are aspirational
+    // — they describe behaviour the chip-side processor has but this
+    // engine still lacks. Those are marked `#[ignore]` with a comment
+    // naming the gap.
     //
-    // The chip-side processor's tap/hold thresholds (`TAP_DIST = 40` chip
-    // units on a 3936-wide pad ≈ 0.010 normalized) are close to this
-    // engine's `TAP_MAX_MOVE = 0.012`, so motion budgets translate roughly
-    // 1:1 after dividing by the pad's logical max.
+    // Threshold parity: rmk's `TAP_DIST = 40` chip units on a 3936-wide,
+    // 65 mm pad ≈ 0.66 mm — close to this engine's
+    // `TAP_MAX_MOVE_MM = 1.0`. Slight conservatism here, since macOS
+    // users expect taps to be forgiving of minor finger drift.
 
     fn at(t0: Instant, ms: u64) -> Instant {
         t0 + Duration::from_millis(ms)
@@ -673,14 +690,15 @@ mod tests {
         );
     }
 
-    /// Single-finger touch with motion exceeding TAP_MAX_MOVE — does not
+    /// Single-finger touch with motion exceeding TAP_MAX_MOVE_MM — does not
     /// tap on lift, only emits cursor motion.
     #[test]
     fn motion_laden_touch_does_not_fire_tap() {
         let r = Recorder::default();
         let mut s = State::new(&r);
         let t0 = Instant::now();
-        // Move ~0.05 along x — well past TAP_MAX_MOVE = 0.012.
+        // Move ~2.5 mm along x (0.05 fraction of the 50 mm test pad)
+        // — well past TAP_MAX_MOVE_MM = 1.0.
         s.on_frame_at(frame(&[(1, 0.50, 0.50)]), t0);
         s.on_frame_at(frame(&[(1, 0.52, 0.50)]), at(t0, 20));
         s.on_frame_at(frame(&[(1, 0.55, 0.50)]), at(t0, 40));
@@ -696,7 +714,7 @@ mod tests {
         );
     }
 
-    /// Diagonal short touch where every contact stays within TAP_MAX_MOVE
+    /// Diagonal short touch where every contact stays within TAP_MAX_MOVE_MM
     /// of its landing point still fires a tap. Mirrors rmk's
     /// `diagonal_short_touch_within_radius_fires_tap` — captures real-device
     /// pattern where a finger wobbles diagonally during a brisk tap.
@@ -706,7 +724,8 @@ mod tests {
         let mut s = State::new(&r);
         let t0 = Instant::now();
         // Series of small diagonal hops; final deviation from start
-        // ≈ √(0.007² + 0.006²) ≈ 0.0092, well under TAP_MAX_MOVE = 0.012.
+        // ≈ √(0.007² + 0.006²) × 50 mm ≈ 0.46 mm, well under
+        // TAP_MAX_MOVE_MM = 1.0.
         s.on_frame_at(frame(&[(1, 0.500, 0.500)]), t0);
         s.on_frame_at(frame(&[(1, 0.502, 0.499)]), at(t0, 13));
         s.on_frame_at(frame(&[(1, 0.504, 0.497)]), at(t0, 26));
@@ -722,7 +741,7 @@ mod tests {
 
     /// Two-finger touch that pans into a scroll then lifts — the lift must
     /// not also fire a right-click tap. Centroid moved well past
-    /// TAP_MAX_MOVE so the tap branch on TwoFingerUnclassified→Idle
+    /// TAP_MAX_MOVE_MM so the tap branch on TwoFingerUnclassified→Idle
     /// shouldn't fire either.
     #[test]
     fn scroll_during_touch_does_not_fire_tap() {
@@ -794,7 +813,7 @@ mod tests {
     #[test]
     #[ignore = "press-and-hold drag not implemented in gesture.rs"]
     fn software_press_and_hold_does_not_latch_with_motion_or_two_fingers() {
-        // Motion past TAP_MAX_MOVE before the hold window — no latch.
+        // Motion past TAP_MAX_MOVE_MM before the hold window — no latch.
         {
             let r = Recorder::default();
             let mut s = State::new(&r);
@@ -805,7 +824,7 @@ mod tests {
             let log = r.pop();
             assert!(
                 !log.iter().any(|l| l.contains("press") || l.contains("down")),
-                "motion past TAP_MAX_MOVE must not latch a hold ({log:?})",
+                "motion past TAP_MAX_MOVE_MM must not latch a hold ({log:?})",
             );
         }
 
@@ -836,18 +855,18 @@ mod tests {
         let r = Recorder::default();
         let mut s = State::new(&r);
         let t0 = Instant::now();
-        // Normal tracking motion at 0.005/frame.
+        // Normal tracking motion at 0.25 mm/frame (0.005 of 50 mm pad).
         s.on_frame_at(frame(&[(1, 0.500, 0.500)]), t0);
         s.on_frame_at(frame(&[(1, 0.505, 0.500)]), at(t0, 13));
         s.on_frame_at(frame(&[(1, 0.510, 0.500)]), at(t0, 26));
-        // Final frame with finger reports a big centroid-shift jump.
+        // Final frame with finger reports a big centroid-shift jump (2.5 mm).
         s.on_frame_at(frame(&[(1, 0.560, 0.500)]), at(t0, 39));
         // Lift.
         s.on_frame_at(frame(&[]), at(t0, 52));
 
         let log = r.pop();
-        // Each emitted move dx should be ≤ 0.01 — i.e. the 0.05 jump on
-        // the last-with-finger frame must be suppressed.
+        // Each emitted move dx should stay near the 0.25 mm/frame baseline;
+        // the 2.5 mm lift-frame jump must not surface. 0.5 mm splits the two.
         for line in &log {
             if let Some(rest) = line.strip_prefix("move ") {
                 let dx: f64 = rest
@@ -856,7 +875,7 @@ mod tests {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0.0);
                 assert!(
-                    dx.abs() <= 0.01,
+                    dx.abs() <= 0.5,
                     "lift-frame centroid jump leaked into cursor ({line})",
                 );
             }

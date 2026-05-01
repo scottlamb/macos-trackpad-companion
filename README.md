@@ -27,8 +27,8 @@ CLI flags:
 | --- | --- | --- |
 | `--vid HEX` | any | Match only this USB vendor ID. |
 | `--pid HEX` | any | Match only this USB product ID. |
-| `--accel N` | 1500 | Cursor pixels per normalized unit. |
-| `--scroll-accel N` | 1200 | Scroll pixels per normalized unit. |
+| `--accel N` | 25 | Screen pixels per millimeter of finger motion (cursor). |
+| `--scroll-accel N` | 20 | Screen pixels per millimeter of finger motion (scroll). |
 | `--no-private-gestures` | off | Disable pinch/rotate/swipe injection. |
 | `-v`, `-vv` | info | Increase log level. |
 
@@ -59,8 +59,12 @@ coordinate scale. To remain compatible:
   - Tip Switch — Digitizer 0x42 — 1 bit
   - 6 bits padding (so the contact-id falls on a byte boundary)
   - Contact Identifier — Digitizer 0x51 — 8 bits
-  - X — Generic Desktop 0x30 — 16 bits, with Logical Max set to your
-    coordinate space (companion normalizes against this)
+  - X — Generic Desktop 0x30 — 16 bits. Set Logical Max to your
+    coordinate space *and* Physical Max + Unit + Unit Exponent so the
+    companion can derive mm/pixel. SI Linear cm (Unit `0x11`) and
+    English Linear inches (Unit `0x13`) are both supported. Without
+    physical units, descriptor parse fails (gesture thresholds and
+    cursor sensitivity are expressed in mm).
   - Y — Generic Desktop 0x31 — 16 bits, same
 - After the finger collections, declare:
   - Scan Time — Digitizer 0x56 — 16 bits (100 µs ticks per spec)

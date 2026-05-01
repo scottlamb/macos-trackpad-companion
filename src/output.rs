@@ -150,9 +150,11 @@ impl Drop for Event {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
-    /// Cursor pixels per logical normalized unit (input coords are [0,1]).
+    /// Screen pixels emitted per millimeter of finger motion. Pad-density
+    /// independent, so a given value gives the same physical sensitivity
+    /// across pads of any logical resolution or aspect ratio.
     pub accel: f64,
-    /// Scroll pixels per logical normalized unit.
+    /// Screen pixels emitted per millimeter of finger motion in scroll mode.
     pub scroll_accel: f64,
     /// Allow private gesture-event injection. If false, pinch/rotate/swipe
     /// are no-ops (or fall back to keyboard shortcuts where sensible).
@@ -188,11 +190,12 @@ pub enum SwipeDirection {
 }
 
 /// Trait surface a gesture engine sees. Implemented by [`Emitter`]
-/// against real CGEvents; in tests, swap in a recording fake.
+/// against real CGEvents; in tests, swap in a recording fake. All
+/// motion arguments are in physical millimeters of finger travel.
 pub trait Output {
-    fn move_cursor_by(&self, dx_units: f64, dy_units: f64);
+    fn move_cursor_by(&self, dx_mm: f64, dy_mm: f64);
     fn click(&self, button: MouseButton);
-    fn scroll(&self, dx_units: f64, dy_units: f64, phase: Phase);
+    fn scroll(&self, dx_mm: f64, dy_mm: f64, phase: Phase);
     fn pinch(&self, delta: f64, phase: Phase);
     fn rotate(&self, delta_degrees: f64, phase: Phase);
     fn swipe(&self, direction: SwipeDirection);
@@ -229,9 +232,9 @@ impl Emitter {
         unsafe { CGEventGetLocation(e.0) }
     }
 
-    pub fn move_cursor_by(&self, dx_units: f64, dy_units: f64) {
-        let dx = dx_units * self.cfg.accel;
-        let dy = dy_units * self.cfg.accel;
+    pub fn move_cursor_by(&self, dx_mm: f64, dy_mm: f64) {
+        let dx = dx_mm * self.cfg.accel;
+        let dy = dy_mm * self.cfg.accel;
         let mut p = self.cursor();
         p.x += dx;
         p.y += dy;
@@ -293,9 +296,9 @@ impl Emitter {
     /// Phased smooth-pixel scroll. `phase` brackets the gesture so apps
     /// (Safari, Maps, etc.) can do rubber-banding and track the gesture
     /// as a continuous interaction rather than discrete wheel ticks.
-    pub fn scroll(&self, dx_units: f64, dy_units: f64, phase: Phase) {
-        let dx = -dx_units * self.cfg.scroll_accel;
-        let dy = -dy_units * self.cfg.scroll_accel;
+    pub fn scroll(&self, dx_mm: f64, dy_mm: f64, phase: Phase) {
+        let dx = -dx_mm * self.cfg.scroll_accel;
+        let dy = -dy_mm * self.cfg.scroll_accel;
         let Some(e) = Event::from_raw(unsafe {
             CGEventCreateScrollWheelEvent2(
                 std::ptr::null_mut(),
@@ -408,14 +411,14 @@ pub enum MouseButton {
 }
 
 impl Output for Emitter {
-    fn move_cursor_by(&self, dx_units: f64, dy_units: f64) {
-        Emitter::move_cursor_by(self, dx_units, dy_units);
+    fn move_cursor_by(&self, dx_mm: f64, dy_mm: f64) {
+        Emitter::move_cursor_by(self, dx_mm, dy_mm);
     }
     fn click(&self, button: MouseButton) {
         Emitter::click(self, button);
     }
-    fn scroll(&self, dx_units: f64, dy_units: f64, phase: Phase) {
-        Emitter::scroll(self, dx_units, dy_units, phase);
+    fn scroll(&self, dx_mm: f64, dy_mm: f64, phase: Phase) {
+        Emitter::scroll(self, dx_mm, dy_mm, phase);
     }
     fn pinch(&self, delta: f64, phase: Phase) {
         Emitter::pinch(self, delta, phase);

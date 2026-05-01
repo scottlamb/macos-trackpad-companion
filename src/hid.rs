@@ -323,13 +323,15 @@ unsafe extern "C" fn on_device_matched(
         }
     };
     log::info!(
-        "matched \"{product}\" (vid={} pid={}): {} contacts, logical max {}×{}, \
-         {} bytes/contact, payload {} bytes total",
+        "matched \"{product}\" (vid={} pid={}): {} contacts, logical max {}×{} \
+         ({:.1}×{:.1} mm), {} bytes/contact, payload {} bytes total",
         vid.map(|v| format!("{:#06x}", v as u16)).unwrap_or_else(|| "?".into()),
         pid.map(|v| format!("{:#06x}", v as u16)).unwrap_or_else(|| "?".into()),
         layout.contact_slots,
         layout.logical_x_max,
         layout.logical_y_max,
+        layout.physical_x_max_mm,
+        layout.physical_y_max_mm,
         layout.bytes_per_contact,
         layout.total_payload_bytes,
     );
@@ -453,11 +455,9 @@ unsafe extern "C" fn on_input_report(
         // idle.
         match frame.contacts.first() {
             Some(c) => log::debug!(
-                "frame n={} c0 id={} raw=({:>4},{:>4}) norm=({:.3},{:.3}) tip={} button={}",
+                "frame n={} c0 id={} at=({:>5.2},{:>5.2})mm tip={} button={}",
                 frame.contacts.len(),
                 c.id,
-                c.raw_x,
-                c.raw_y,
                 c.x,
                 c.y,
                 c.tip,

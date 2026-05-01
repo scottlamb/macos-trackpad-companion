@@ -38,7 +38,27 @@ pub struct Layout {
     pub button_bit: u8,
     pub logical_x_max: i32,
     pub logical_y_max: i32,
+    /// Physical pad width in millimeters, derived from the descriptor's
+    /// Physical Maximum + Unit + Unit Exponent items for the X field.
+    /// Required: `parse` rejects descriptors that omit physical units,
+    /// since gesture thresholds and cursor sensitivity are expressed in
+    /// mm and there's no sane fallback.
+    pub physical_x_max_mm: f64,
+    pub physical_y_max_mm: f64,
     pub total_payload_bytes: usize,
+}
+
+impl Layout {
+    /// Conversion factor from one chip-pixel of X displacement to
+    /// millimeters. Density typically differs between axes
+    /// (e.g. SoflePLUS2 IQS5xx panel: ~41.8 px/mm on X, ~47.3 px/mm on Y),
+    /// so always scale per-axis when comparing distances.
+    pub fn mm_per_logical_px_x(&self) -> f64 {
+        self.physical_x_max_mm / self.logical_x_max.max(1) as f64
+    }
+    pub fn mm_per_logical_px_y(&self) -> f64 {
+        self.physical_y_max_mm / self.logical_y_max.max(1) as f64
+    }
 }
 
 impl Layout {
@@ -67,6 +87,16 @@ struct Walker<'a> {
     usage_page: u16,
     logical_min: i32,
     logical_max: i32,
+    physical_min: i32,
+    physical_max: i32,
+    /// HID Unit item (32-bit nibble-encoded). Nibble 0 is the unit
+    /// system (1 = SI Linear → cm, 3 = English Linear → in); nibble 1
+    /// is the length exponent (4-bit signed). Other nibbles are
+    /// unused for X/Y length fields.
+    unit: u32,
+    /// HID Unit Exponent item: power of 10 applied to the on-wire
+    /// physical value, 4-bit signed (raw 0..7 = 0..7, raw 8..F = -8..-1).
+    unit_exponent: i32,
     report_size: u32,
     report_count: u32,
     report_id: u8,
@@ -99,6 +129,8 @@ struct Walker<'a> {
     buttons: HashMap<u8, FieldRef>,
     logical_x_max: Option<i32>,
     logical_y_max: Option<i32>,
+    physical_x_max_mm: Option<f64>,
+    physical_y_max_mm: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -135,6 +167,10 @@ impl<'a> Walker<'a> {
             usage_page: 0,
             logical_min: 0,
             logical_max: 0,
+            physical_min: 0,
+            physical_max: 0,
+            unit: 0,
+            unit_exponent: 0,
             report_size: 0,
             report_count: 0,
             report_id: 0,
@@ -151,6 +187,8 @@ impl<'a> Walker<'a> {
             buttons: HashMap::new(),
             logical_x_max: None,
             logical_y_max: None,
+            physical_x_max_mm: None,
+            physical_y_max_mm: None,
         }
     }
 
@@ -285,6 +323,8 @@ impl<'a> Walker<'a> {
                         b.has_x = true;
                         if self.logical_x_max.is_none() {
                             self.logical_x_max = Some(self.logical_max);
+                            self.physical_x_max_mm =
+                                physical_to_mm(self.physical_max, self.unit, self.unit_exponent);
                         }
                     }
                 }
@@ -293,6 +333,8 @@ impl<'a> Walker<'a> {
                         b.has_y = true;
                         if self.logical_y_max.is_none() {
                             self.logical_y_max = Some(self.logical_max);
+                            self.physical_y_max_mm =
+                                physical_to_mm(self.physical_max, self.unit, self.unit_exponent);
                         }
                     }
                 }
@@ -333,6 +375,16 @@ impl<'a> Walker<'a> {
             0 => self.usage_page = udata as u16,
             1 => self.logical_min = sdata,
             2 => self.logical_max = sdata,
+            3 => self.physical_min = sdata,
+            4 => self.physical_max = sdata,
+            5 => {
+                // Unit Exponent is 4-bit signed in the data's low nibble
+                // (raw 0..7 = 0..7, raw 8..F = -8..-1). Higher bits of
+                // the data field are unused.
+                let nib = (udata & 0xF) as i32;
+                self.unit_exponent = if nib & 0x8 != 0 { nib - 16 } else { nib };
+            }
+            6 => self.unit = udata,
             7 => self.report_size = udata,
             8 => {
                 let id = udata as u8;
@@ -415,6 +467,12 @@ impl<'a> Walker<'a> {
 
         let total_bits = self.bit_cursor.get(&report_id).copied().unwrap_or(0);
 
+        let physical_x_max_mm = self
+            .physical_x_max_mm
+            .ok_or_else(|| anyhow!("descriptor missing Physical Max + Unit (cm/in length) for X"))?;
+        let physical_y_max_mm = self
+            .physical_y_max_mm
+            .ok_or_else(|| anyhow!("descriptor missing Physical Max + Unit (cm/in length) for Y"))?;
         let layout = Layout {
             report_id,
             contact_slots: self.finger_blocks.len(),
@@ -426,11 +484,41 @@ impl<'a> Walker<'a> {
             button_bit: (button.bit_offset % 8) as u8,
             logical_x_max: self.logical_x_max.unwrap_or(1),
             logical_y_max: self.logical_y_max.unwrap_or(1),
+            physical_x_max_mm,
+            physical_y_max_mm,
             total_payload_bytes: total_bits.div_ceil(8),
         };
         layout.validate()?;
         Ok(layout)
     }
+}
+
+/// Convert a Physical Maximum value to millimeters using the active
+/// HID Unit and Unit Exponent. Returns `None` if the unit isn't a pure
+/// length in a system we know how to scale (SI Linear → cm, English
+/// Linear → in), or if the firmware never declared a Physical Maximum
+/// (`physical == 0` and unit nibbles also zero, the post-reset default).
+///
+/// HID Unit encoding (Usage Tables §6.2.2.7): nibble 0 selects the unit
+/// system (1 = SI Linear, 3 = English Linear), nibble 1 is the length
+/// exponent (4-bit signed; we only handle ^1 — pure length, not area or
+/// inverse length).
+fn physical_to_mm(physical: i32, unit: u32, unit_exponent: i32) -> Option<f64> {
+    if physical == 0 && unit == 0 {
+        return None;
+    }
+    let system = unit & 0xF;
+    let length_nib = ((unit >> 4) & 0xF) as i32;
+    let length_exp = if length_nib & 0x8 != 0 { length_nib - 16 } else { length_nib };
+    if length_exp != 1 {
+        return None;
+    }
+    let scale_to_mm = match system {
+        1 => 10.0,   // SI Linear: cm → mm
+        3 => 25.4,   // English Linear: in → mm
+        _ => return None,
+    };
+    Some((physical as f64) * 10f64.powi(unit_exponent) * scale_to_mm)
 }
 
 fn read_uint(bytes: &[u8]) -> u32 {
@@ -492,6 +580,11 @@ mod tests {
         assert_eq!(layout.button_bit, 0);
         assert_eq!(layout.logical_x_max, 3936);
         assert_eq!(layout.logical_y_max, 2424);
+        // Physical Max + Unit (SI cm) + Unit Exponent (-2): X Physical
+        // Max = 0x028A (650) → 6.50 cm = 65.0 mm; Y Physical Max = 0x0190
+        // (400) → 4.00 cm = 40.0 mm.
+        assert!((layout.physical_x_max_mm - 65.0).abs() < 1e-6);
+        assert!((layout.physical_y_max_mm - 40.0).abs() < 1e-6);
         assert_eq!(layout.total_payload_bytes, 35);
     }
 
