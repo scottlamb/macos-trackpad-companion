@@ -80,6 +80,16 @@ pub struct State<O: Output> {
     max_move_sq: f64,
     two_baseline: Option<TwoFingerBaseline>,
     multi_baseline: Option<MultiBaseline>,
+    /// One-frame deferred cursor motion. `dispatch_one` emits the
+    /// previous frame's value and stages the current frame's; on
+    /// transition out of `OneFinger` (most importantly to `Idle` on
+    /// lift) the buffered value is discarded. Mirrors rmk's
+    /// `TrackpadProcessor::pending_motion` — the chip's last
+    /// with-finger frame commonly carries a centroid-shift artifact
+    /// (the contact patch shrinks asymmetrically as the finger rolls
+    /// off) that, if emitted, teleports the cursor on release. Costs
+    /// ~one chip cycle of cursor latency for not getting that jump.
+    pending_motion: Option<(f64, f64)>,
 }
 
 impl<O: Output> State<O> {
@@ -93,6 +103,7 @@ impl<O: Output> State<O> {
             max_move_sq: 0.0,
             two_baseline: None,
             multi_baseline: None,
+            pending_motion: None,
         }
     }
 
@@ -176,25 +187,63 @@ impl<O: Output> State<O> {
         // Close out the old gesture.
         match self.kind {
             GestureKind::OneFinger => {
+                // Drop any deferred cursor motion. On a transition to
+                // Idle this is the chip's last with-finger frame's
+                // motion (often a centroid-shift artifact); on a
+                // transition to TwoFinger* it's stale single-finger
+                // motion that's no longer meaningful.
+                let dropped = self.pending_motion.take();
                 if matches!(new_kind, GestureKind::Idle) {
                     let dur = now - self.started_at;
-                    if dur < TAP_MAX_DURATION
-                        && self.max_move_sq.sqrt() < TAP_MAX_MOVE
-                    {
+                    let max_move = self.max_move_sq.sqrt();
+                    if dur < TAP_MAX_DURATION && max_move < TAP_MAX_MOVE {
+                        log::debug!(
+                            "1f tap: click Left (dur={}ms max_move={:.4}{})",
+                            dur.as_millis(),
+                            max_move,
+                            if dropped.is_some() { ", dropped lift-frame motion" } else { "" },
+                        );
                         self.out.click(MouseButton::Left);
+                    } else {
+                        log::debug!(
+                            "1f lift, no tap: dur={}ms max_move={:.4} (limits dur<{}ms move<{:.4})",
+                            dur.as_millis(),
+                            max_move,
+                            TAP_MAX_DURATION.as_millis(),
+                            TAP_MAX_MOVE,
+                        );
                     }
                 }
             }
-            GestureKind::TwoFingerPan => self.out.scroll(0.0, 0.0, Phase::Ended),
-            GestureKind::TwoFingerPinch => self.out.pinch(0.0, Phase::Ended),
-            GestureKind::TwoFingerRotate => self.out.rotate(0.0, Phase::Ended),
+            GestureKind::TwoFingerPan => {
+                log::debug!("scroll: ended");
+                self.out.scroll(0.0, 0.0, Phase::Ended);
+            }
+            GestureKind::TwoFingerPinch => {
+                log::debug!("pinch: ended");
+                self.out.pinch(0.0, Phase::Ended);
+            }
+            GestureKind::TwoFingerRotate => {
+                log::debug!("rotate: ended");
+                self.out.rotate(0.0, Phase::Ended);
+            }
             GestureKind::TwoFingerUnclassified => {
                 if matches!(new_kind, GestureKind::Idle) {
                     let dur = now - self.started_at;
-                    if dur < TAP_MAX_DURATION
-                        && self.max_move_sq.sqrt() < TAP_MAX_MOVE
-                    {
+                    let max_move = self.max_move_sq.sqrt();
+                    if dur < TAP_MAX_DURATION && max_move < TAP_MAX_MOVE {
+                        log::debug!(
+                            "2f tap: click Right (dur={}ms max_move={:.4})",
+                            dur.as_millis(),
+                            max_move,
+                        );
                         self.out.click(MouseButton::Right);
+                    } else {
+                        log::debug!(
+                            "2f lift, no tap: dur={}ms max_move={:.4}",
+                            dur.as_millis(),
+                            max_move,
+                        );
                     }
                 }
             }
@@ -248,24 +297,28 @@ impl<O: Output> State<O> {
         }
     }
 
-    fn dispatch_one(&self, active: &[Contact]) {
+    fn dispatch_one(&mut self, active: &[Contact]) {
         let c = active[0];
         let Some(tr) = self.contacts.get(&c.id) else {
             return;
         };
         let dx = tr.x - tr.prev_x;
         let dy = tr.y - tr.prev_y;
-        if dx.abs() > MOTION_DEAD_ZONE || dy.abs() > MOTION_DEAD_ZONE {
-            log::debug!(
-                "cursor id={} norm_d=({:+.4},{:+.4}) raw=({},{})",
-                c.id,
-                dx,
-                dy,
-                c.raw_x,
-                c.raw_y,
-            );
-            self.out.move_cursor_by(dx, dy);
+        // Emit the previous frame's deferred motion (if any), then
+        // stash this frame's. On lift the `transition` arm clears
+        // `pending_motion` without emitting it — that's what drops
+        // the centroid-shift jump that capacitive trackpads commonly
+        // report on the last with-finger frame.
+        if let Some((bdx, bdy)) = self.pending_motion.take() {
+            if bdx.abs() > MOTION_DEAD_ZONE || bdy.abs() > MOTION_DEAD_ZONE {
+                log::debug!(
+                    "cursor: emit deferred d=({:+.4},{:+.4}) (cur frame raw=({},{}))",
+                    bdx, bdy, c.raw_x, c.raw_y,
+                );
+                self.out.move_cursor_by(bdx, bdy);
+            }
         }
+        self.pending_motion = Some((dx, dy));
     }
 
     fn dispatch_two(&mut self, active: &[Contact]) {
@@ -302,9 +355,18 @@ impl<O: Output> State<O> {
                 };
                 self.kind = new_kind;
                 match new_kind {
-                    GestureKind::TwoFingerPan => self.out.scroll(0.0, 0.0, Phase::Began),
-                    GestureKind::TwoFingerPinch => self.out.pinch(0.0, Phase::Began),
-                    GestureKind::TwoFingerRotate => self.out.rotate(0.0, Phase::Began),
+                    GestureKind::TwoFingerPan => {
+                        log::debug!("scroll: began (pan_score={:.2})", pan);
+                        self.out.scroll(0.0, 0.0, Phase::Began);
+                    }
+                    GestureKind::TwoFingerPinch => {
+                        log::debug!("pinch: began (pinch_score={:.2})", pinch);
+                        self.out.pinch(0.0, Phase::Began);
+                    }
+                    GestureKind::TwoFingerRotate => {
+                        log::debug!("rotate: began (rot_score={:.2})", rot);
+                        self.out.rotate(0.0, Phase::Began);
+                    }
                     _ => {}
                 }
             }
@@ -315,7 +377,7 @@ impl<O: Output> State<O> {
                 let ddx = centroid.0 - base.last_centroid.0;
                 let ddy = centroid.1 - base.last_centroid.1;
                 if ddx.abs() > MOTION_DEAD_ZONE || ddy.abs() > MOTION_DEAD_ZONE {
-                    log::debug!("scroll norm_d=({:+.4},{:+.4})", ddx, ddy);
+                    log::debug!("scroll: d=({:+.4},{:+.4})", ddx, ddy);
                     self.out.scroll(ddx, ddy, Phase::Changed);
                 }
             }
@@ -323,6 +385,7 @@ impl<O: Output> State<O> {
                 let scale = dist / base.initial_distance;
                 let delta = scale - base.last_scale_emitted;
                 if delta.abs() > 1e-4 {
+                    log::debug!("pinch: delta={:+.4} scale={:.4}", delta, scale);
                     self.out.pinch(delta, Phase::Changed);
                     base.last_scale_emitted = scale;
                 }
@@ -330,6 +393,7 @@ impl<O: Output> State<O> {
             GestureKind::TwoFingerRotate => {
                 let delta = angle_delta(ang, base.last_angle);
                 if delta.abs() > 1e-4 {
+                    log::debug!("rotate: delta={:+.2}deg", delta.to_degrees());
                     self.out.rotate(delta.to_degrees(), Phase::Changed);
                 }
             }
@@ -367,6 +431,13 @@ impl<O: Output> State<O> {
         };
 
         if let Some(direction) = dir {
+            log::debug!(
+                "swipe: {:?} (n_fingers={} centroid_d=({:+.4},{:+.4}))",
+                direction,
+                active.len(),
+                dx,
+                dy,
+            );
             self.out.swipe(direction);
             self.kind = GestureKind::SwipeLatched;
         }
@@ -471,8 +542,14 @@ mod tests {
     fn one_finger_drag_emits_cursor() {
         let r = Recorder::default();
         let mut s = State::new(&r);
+        // Cursor motion is deferred by one frame, so a 3-frame sequence
+        // is needed for the second frame's motion to surface (the third
+        // frame, with a finger still down, drains the buffer). A 2-frame
+        // sequence would leave the motion in `pending_motion` and the
+        // implicit lift on the next call would drop it.
         s.on_frame(frame(&[(1, 0.5, 0.5)]));
         s.on_frame(frame(&[(1, 0.6, 0.5)]));
+        s.on_frame(frame(&[(1, 0.7, 0.5)]));
         let log = r.pop();
         assert!(log.iter().any(|l| l.starts_with("move ")), "{log:?}");
     }
@@ -749,17 +826,12 @@ mod tests {
 
     /// On finger lift, the last frame's motion is commonly a centroid-shift
     /// artifact (the contact patch shrinks asymmetrically) and should not
-    /// be emitted as cursor motion. The chip-side processor buffers one
-    /// frame and discards it on lift; this engine emits motion immediately
-    /// on every frame, so a fast lift with a trailing-edge jump teleports
-    /// the cursor.
+    /// be emitted as cursor motion. The engine buffers `dispatch_one`
+    /// motion by one frame and drops the buffered value on the lift
+    /// transition.
     ///
     /// Port of rmk's `lift_suppresses_prior_frame_centroid_shift_jump`.
-    /// Implementing this here means buffering the last frame's emitted
-    /// `move_cursor_by` until the next frame arrives — and dropping it
-    /// when that next frame has zero contacts.
     #[test]
-    #[ignore = "one-frame lift suppression not implemented in gesture.rs"]
     fn lift_suppresses_prior_frame_centroid_shift_jump() {
         let r = Recorder::default();
         let mut s = State::new(&r);

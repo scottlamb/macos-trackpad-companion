@@ -11,7 +11,22 @@
 #![allow(non_upper_case_globals)]
 
 use core_graphics::geometry::CGPoint;
+use std::cell::Cell;
 use std::ffi::c_void;
+use std::time::{Duration, Instant};
+
+/// Hardcoded macOS double-click interval. Configurable in System
+/// Settings (Mouse → Double-Click Speed) but rarely changed; querying
+/// `CGEventSourceGetDoubleClickInterval` on every click is overkill,
+/// and the default works for almost everyone. Promote to a CLI flag
+/// if a user needs to tune it.
+const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+/// Maximum cursor displacement (pixels) between successive clicks for
+/// them to count as a multi-click sequence. macOS doesn't expose this
+/// as a public API; 5 px matches stock NSEvent behaviour. Without this
+/// guard, a click → drift → click sequence would still register as
+/// double-click when it should reset to 1.
+const DOUBLE_CLICK_DISTANCE_PX: f64 = 5.0;
 
 // ---------- Public CGEvent constants (mirrored from CGEventTypes.h) ----------
 
@@ -28,6 +43,10 @@ const kCGScrollEventUnitPixel: u32 = 0;
 
 const kCGHIDEventTap: u32 = 0;
 
+/// `kCGMouseEventClickState` — the click count (1, 2, 3, …) macOS
+/// uses to decide whether to deliver a double/triple-click. Synthetic
+/// CGEvents don't get this auto-computed; callers must set it.
+const kCGMouseEventClickState: u32 = 1;
 const kCGMouseEventDeltaX: u32 = 35;
 const kCGMouseEventDeltaY: u32 = 36;
 
@@ -179,14 +198,26 @@ pub trait Output {
     fn swipe(&self, direction: SwipeDirection);
 }
 
-#[derive(Clone, Copy, Debug)]
 pub struct Emitter {
     cfg: Config,
+    /// Most recent click that produced a CGEvent post: button + time +
+    /// cursor location. The next click checks this to decide its
+    /// `kCGMouseEventClickState` value — same button, within
+    /// [`DOUBLE_CLICK_INTERVAL`], within [`DOUBLE_CLICK_DISTANCE_PX`] →
+    /// increment; otherwise reset to 1. macOS doesn't auto-compute the
+    /// click count for synthetic events, so triple-click etc. depend
+    /// entirely on this field.
+    last_click: Cell<Option<(MouseButton, Instant, CGPoint)>>,
+    click_count: Cell<i64>,
 }
 
 impl Emitter {
     pub fn new(cfg: Config) -> Self {
-        Self { cfg }
+        Self {
+            cfg,
+            last_click: Cell::new(None),
+            click_count: Cell::new(0),
+        }
     }
 
     pub fn cursor(&self) -> CGPoint {
@@ -211,23 +242,50 @@ impl Emitter {
         };
         e.set_int(kCGMouseEventDeltaX as u32, dx as i64);
         e.set_int(kCGMouseEventDeltaY as u32, dy as i64);
+        log::trace!("post: mouseMoved d=({:+.1},{:+.1})px to=({:.0},{:.0})", dx, dy, p.x, p.y);
         e.post();
     }
 
     pub fn click(&self, button: MouseButton) {
         let p = self.cursor();
+        let now = Instant::now();
+        // Decide the click count for this event. Same button, within
+        // the double-click time and distance windows → increment;
+        // otherwise reset to 1. Both the down and up events of this
+        // click carry the same count, matching what macOS does for
+        // natural input.
+        let count = match self.last_click.get() {
+            Some((b, t, last_p))
+                if b == button
+                    && now.saturating_duration_since(t) < DOUBLE_CLICK_INTERVAL
+                    && ((p.x - last_p.x).powi(2) + (p.y - last_p.y).powi(2)).sqrt()
+                        < DOUBLE_CLICK_DISTANCE_PX =>
+            {
+                self.click_count.get() + 1
+            }
+            _ => 1,
+        };
+        self.click_count.set(count);
+        self.last_click.set(Some((button, now, p)));
+
         let (down, up, raw_button) = match button {
             MouseButton::Left => (kCGEventLeftMouseDown, kCGEventLeftMouseUp, kCGMouseButtonLeft),
             MouseButton::Right => (kCGEventRightMouseDown, kCGEventRightMouseUp, kCGMouseButtonRight),
         };
+        log::debug!(
+            "post: click {:?} count={} at=({:.0},{:.0})",
+            button, count, p.x, p.y,
+        );
         if let Some(e) = Event::from_raw(unsafe {
             CGEventCreateMouseEvent(std::ptr::null_mut(), down, p, raw_button)
         }) {
+            e.set_int(kCGMouseEventClickState, count);
             e.post();
         }
         if let Some(e) = Event::from_raw(unsafe {
             CGEventCreateMouseEvent(std::ptr::null_mut(), up, p, raw_button)
         }) {
+            e.set_int(kCGMouseEventClickState, count);
             e.post();
         }
     }
@@ -252,6 +310,7 @@ impl Emitter {
         };
         e.set_int(kCGScrollWheelEventScrollPhase as u32, phase.mask());
         e.set_int(kCGScrollWheelEventMomentumPhase as u32, PHASE_NONE);
+        log::trace!("post: scroll {:?} d=({:+.0},{:+.0})px", phase, dx, dy);
         e.post();
     }
 
@@ -260,6 +319,7 @@ impl Emitter {
     /// required for apps to track the gesture.
     pub fn pinch(&self, delta: f64, phase: Phase) {
         if !self.cfg.private_gestures {
+            log::trace!("post: pinch suppressed (private_gestures=false)");
             return;
         }
         if matches!(phase, Phase::Began) {
@@ -269,6 +329,7 @@ impl Emitter {
             e.set_type(kCGEventGestureMagnify);
             e.set_int(FIELD_GESTURE_PHASE, phase.mask());
             e.set_dbl(FIELD_GESTURE_VALUE, delta);
+            log::trace!("post: pinch {:?} delta={:+.4}", phase, delta);
             e.post();
         }
         if matches!(phase, Phase::Ended | Phase::Cancelled) {
@@ -281,6 +342,7 @@ impl Emitter {
     /// NSEvent.rotation semantics).
     pub fn rotate(&self, delta_degrees: f64, phase: Phase) {
         if !self.cfg.private_gestures {
+            log::trace!("post: rotate suppressed (private_gestures=false)");
             return;
         }
         if matches!(phase, Phase::Began) {
@@ -290,6 +352,7 @@ impl Emitter {
             e.set_type(kCGEventGestureRotate);
             e.set_int(FIELD_GESTURE_PHASE, phase.mask());
             e.set_dbl(FIELD_GESTURE_VALUE, delta_degrees);
+            log::trace!("post: rotate {:?} delta={:+.2}deg", phase, delta_degrees);
             e.post();
         }
         if matches!(phase, Phase::Ended | Phase::Cancelled) {
@@ -301,8 +364,10 @@ impl Emitter {
     /// discrete navigation event (Safari back/forward, etc.).
     pub fn swipe(&self, direction: SwipeDirection) {
         if !self.cfg.private_gestures {
+            log::debug!("post: swipe {:?} suppressed (private_gestures=false)", direction);
             return;
         }
+        log::debug!("post: swipe {:?}", direction);
         let (dx, dy): (f64, f64) = match direction {
             SwipeDirection::Left => (-1.0, 0.0),
             SwipeDirection::Right => (1.0, 0.0),
@@ -336,7 +401,7 @@ impl Emitter {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MouseButton {
     Left,
     Right,
