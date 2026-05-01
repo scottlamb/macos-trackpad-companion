@@ -29,6 +29,7 @@ CLI flags:
 | `--pid HEX` | any | Match only this USB product ID. |
 | `--accel N` | 25 | Screen pixels per millimeter of finger motion (cursor). |
 | `--scroll-accel N` | 20 | Screen pixels per millimeter of finger motion (scroll). |
+| `--invert-scroll` | off | Use the legacy "wheel" scroll direction (off → macOS-style natural scrolling). |
 | `--no-private-gestures` | off | Disable pinch/rotate/swipe injection. |
 | `-v`, `-vv` | info | Increase log level. |
 

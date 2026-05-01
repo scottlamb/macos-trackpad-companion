@@ -45,6 +45,12 @@ struct Args {
     #[arg(long, default_value_t = 20.0)]
     scroll_accel: f64,
 
+    /// Use the legacy "wheel" scroll direction (finger-down → content up,
+    /// the way macOS shipped before 10.7). Off by default → finger-down →
+    /// content-down, matching macOS's "Natural" scrolling.
+    #[arg(long)]
+    invert_scroll: bool,
+
     /// Verbose logging. Repeat for trace-level (-vv).
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -77,6 +83,7 @@ fn main() -> Result<()> {
     let cfg = output::Config {
         accel: args.accel,
         scroll_accel: args.scroll_accel,
+        natural_scroll: !args.invert_scroll,
         private_gestures: !args.no_private_gestures,
     };
     let emitter = output::Emitter::new(cfg);

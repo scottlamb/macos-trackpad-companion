@@ -20,11 +20,17 @@ use std::time::{Duration, Instant};
 // finger ergonomics, not pad fractions.
 
 /// Max distance a contact may drift from its landing point during a
-/// short touch and still count as a tap. ~1 mm covers normal finger
-/// jitter without admitting deliberate cursor moves.
-const TAP_MAX_MOVE_MM: f64 = 1.0;
-/// Max touch duration to count as a tap.
-const TAP_MAX_DURATION: Duration = Duration::from_millis(220);
+/// short touch and still count as a tap. Matches rmk's `TAP_DIST = 40`
+/// chip units (≈ 0.66 mm on its 65 mm pad). Going looser added a
+/// noticeable latency to scroll onset — every chip frame whose
+/// per-contact drift hadn't yet crossed this threshold delayed the
+/// `TwoFingerUnclassified → TwoFingerPan` lock — so we match rmk
+/// even though it's slightly less tap-forgiving than macOS conventions.
+const TAP_MAX_MOVE_MM: f64 = 0.66;
+/// Max touch duration to count as a tap. Matches rmk's `TAP_TIME` for
+/// the same reason as `TAP_MAX_MOVE_MM`: a longer window pushes scroll
+/// onset out by the same amount on slow / barely-moving touches.
+const TAP_MAX_DURATION: Duration = Duration::from_millis(150);
 /// Centroid motion below this between frames is treated as jitter.
 const MOTION_DEAD_ZONE_MM: f64 = 0.04;
 
@@ -37,6 +43,12 @@ const ROTATE_LOCK_RAD: f64 = 6.0_f64 * std::f64::consts::PI / 180.0;
 
 /// Centroid travel needed to fire a 3F or 4F swipe.
 const SWIPE_TRIGGER_MM: f64 = 5.0;
+
+/// EMA weight on the freshest velocity sample during 2F pan, in [0, 1].
+/// 0.4 ≈ 2.5-frame averaging window on a ~125 Hz pad — fast enough to
+/// catch a flick, slow enough that one noisy chip frame doesn't dominate
+/// the inertia seed. Mirrors rmk's `VEL_EMA_NUM/VEL_EMA_DEN = 96/256`.
+const SCROLL_VELOCITY_ALPHA: f64 = 0.4;
 
 #[derive(Clone, Copy, Debug)]
 struct Tracked {
@@ -72,11 +84,36 @@ struct TwoFingerBaseline {
     last_centroid: (f64, f64),
     last_scale_emitted: f64,
     last_angle: f64,
+    /// EMA-smoothed centroid velocity in mm/sec, sampled while in
+    /// `TwoFingerPan`. Seeds inertia at lift via `Output::scroll_inertia`
+    /// — modeled on rmk's `TrackpadProcessor` velocity track.
+    scroll_velocity: (f64, f64),
+    /// Time of the most recent scroll-event emission. Combined with the
+    /// new event's timestamp to compute the per-frame dt that turns a
+    /// per-frame mm delta into a mm/sec velocity sample.
+    last_scroll_time: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct MultiBaseline {
     initial_centroid: (f64, f64),
+}
+
+/// Carry-over state from a 2F touch whose fingers lifted asynchronously
+/// (one before the other). Captured at the
+/// TwoFingerUnclassified → OneFinger transition; consumed at the
+/// subsequent OneFinger → Idle transition. While set, the residual 1F
+/// touch is not eligible to fire its own left-click — it's the tail of
+/// the 2F gesture, not a fresh 1F tap.
+#[derive(Clone, Copy, Debug)]
+struct PendingTwoFingerTap {
+    /// When the 2F gesture (not the residual 1F) began. Used to decide
+    /// whether the right-click is still in the original tap window.
+    started_at: Instant,
+    /// Worst-case per-contact motion observed during the 2F phase.
+    /// Combined (via max) with the residual 1F's `max_move_sq` to
+    /// decide whether to fire the right-click.
+    max_move_sq: f64,
 }
 
 pub struct State<O: Output> {
@@ -98,6 +135,7 @@ pub struct State<O: Output> {
     /// off) that, if emitted, teleports the cursor on release. Costs
     /// ~one chip cycle of cursor latency for not getting that jump.
     pending_motion: Option<(f64, f64)>,
+    pending_two_finger_tap: Option<PendingTwoFingerTap>,
 }
 
 impl<O: Output> State<O> {
@@ -112,6 +150,7 @@ impl<O: Output> State<O> {
             two_baseline: None,
             multi_baseline: None,
             pending_motion: None,
+            pending_two_finger_tap: None,
         }
     }
 
@@ -192,6 +231,15 @@ impl<O: Output> State<O> {
         active: &[Contact],
         now: Instant,
     ) {
+        // First contact after Idle cancels any in-flight scroll inertia.
+        // `SwipeLatched → Idle → ...` doesn't count: a deliberate new
+        // touch has to come from no-fingers, and the user wants their
+        // touch to stop a fling rather than blend into it.
+        if matches!(self.kind, GestureKind::Idle)
+            && !matches!(new_kind, GestureKind::Idle | GestureKind::SwipeLatched)
+        {
+            self.out.cancel_inertia();
+        }
         // Close out the old gesture.
         match self.kind {
             GestureKind::OneFinger => {
@@ -201,31 +249,72 @@ impl<O: Output> State<O> {
                 // transition to TwoFinger* it's stale single-finger
                 // motion that's no longer meaningful.
                 let dropped = self.pending_motion.take();
+                // A pending two-finger tap that doesn't get consumed by
+                // an Idle transition (e.g. the residual finger gets
+                // joined by a third — back to a 2F gesture) must be
+                // discarded; the 2F lift sequence is over.
+                let pending_2f = self.pending_two_finger_tap.take();
                 if matches!(new_kind, GestureKind::Idle) {
-                    let dur = now - self.started_at;
-                    let max_move = self.max_move_sq.sqrt();
-                    if dur < TAP_MAX_DURATION && max_move < TAP_MAX_MOVE_MM {
-                        log::debug!(
-                            "1f tap: click Left (dur={}ms max_move={:.2}mm{})",
-                            dur.as_millis(),
-                            max_move,
-                            if dropped.is_some() { ", dropped lift-frame motion" } else { "" },
-                        );
-                        self.out.click(MouseButton::Left);
+                    if let Some(p) = pending_2f {
+                        // Residual 1F is the tail of an asynchronous 2F
+                        // lift. Combine the 2F window/motion with the
+                        // residual's to decide whether the right-click
+                        // still qualifies; either way, suppress the
+                        // residual's own left-click path.
+                        let total_dur = now - p.started_at;
+                        let combined_max_move = p.max_move_sq.max(self.max_move_sq).sqrt();
+                        if total_dur < TAP_MAX_DURATION && combined_max_move < TAP_MAX_MOVE_MM {
+                            log::debug!(
+                                "2f tap (split lift): click Right (total_dur={}ms combined_max_move={:.2}mm)",
+                                total_dur.as_millis(),
+                                combined_max_move,
+                            );
+                            self.out.click(MouseButton::Right);
+                        } else {
+                            log::debug!(
+                                "2f tap (split lift): no click (total_dur={}ms combined_max_move={:.2}mm)",
+                                total_dur.as_millis(),
+                                combined_max_move,
+                            );
+                        }
                     } else {
-                        log::debug!(
-                            "1f lift, no tap: dur={}ms max_move={:.2}mm (limits dur<{}ms move<{:.2}mm)",
-                            dur.as_millis(),
-                            max_move,
-                            TAP_MAX_DURATION.as_millis(),
-                            TAP_MAX_MOVE_MM,
-                        );
+                        let dur = now - self.started_at;
+                        let max_move = self.max_move_sq.sqrt();
+                        if dur < TAP_MAX_DURATION && max_move < TAP_MAX_MOVE_MM {
+                            log::debug!(
+                                "1f tap: click Left (dur={}ms max_move={:.2}mm{})",
+                                dur.as_millis(),
+                                max_move,
+                                if dropped.is_some() { ", dropped lift-frame motion" } else { "" },
+                            );
+                            self.out.click(MouseButton::Left);
+                        } else {
+                            log::debug!(
+                                "1f lift, no tap: dur={}ms max_move={:.2}mm (limits dur<{}ms move<{:.2}mm)",
+                                dur.as_millis(),
+                                max_move,
+                                TAP_MAX_DURATION.as_millis(),
+                                TAP_MAX_MOVE_MM,
+                            );
+                        }
                     }
                 }
             }
             GestureKind::TwoFingerPan => {
-                log::debug!("scroll: ended");
+                let (vx, vy) = self
+                    .two_baseline
+                    .map(|b| b.scroll_velocity)
+                    .unwrap_or((0.0, 0.0));
+                let speed = (vx * vx + vy * vy).sqrt();
+                log::debug!(
+                    "scroll: ended (v=({:+.0},{:+.0})mm/s speed={:.0}mm/s)",
+                    vx, vy, speed,
+                );
                 self.out.scroll(0.0, 0.0, Phase::Ended);
+                // Seed inertia from the lift velocity. `Output` decides
+                // whether the seed is fast enough to coast on; gesture-side
+                // we always offer it.
+                self.out.scroll_inertia(vx, vy);
             }
             GestureKind::TwoFingerPinch => {
                 log::debug!("pinch: ended");
@@ -236,10 +325,11 @@ impl<O: Output> State<O> {
                 self.out.rotate(0.0, Phase::Ended);
             }
             GestureKind::TwoFingerUnclassified => {
+                let dur = now - self.started_at;
+                let max_move = self.max_move_sq.sqrt();
+                let tap_eligible = dur < TAP_MAX_DURATION && max_move < TAP_MAX_MOVE_MM;
                 if matches!(new_kind, GestureKind::Idle) {
-                    let dur = now - self.started_at;
-                    let max_move = self.max_move_sq.sqrt();
-                    if dur < TAP_MAX_DURATION && max_move < TAP_MAX_MOVE_MM {
+                    if tap_eligible {
                         log::debug!(
                             "2f tap: click Right (dur={}ms max_move={:.2}mm)",
                             dur.as_millis(),
@@ -253,6 +343,20 @@ impl<O: Output> State<O> {
                             max_move,
                         );
                     }
+                } else if matches!(new_kind, GestureKind::OneFinger) && tap_eligible {
+                    // One finger lifted while the 2F was still tap-eligible.
+                    // Stash the 2F window/motion so the next OneFinger → Idle
+                    // can fire the right-click; until then, the residual 1F
+                    // is part of this gesture, not a fresh 1F tap.
+                    log::debug!(
+                        "2f → 1f partial lift (dur={}ms max_move={:.2}mm); pending right-click",
+                        dur.as_millis(),
+                        max_move,
+                    );
+                    self.pending_two_finger_tap = Some(PendingTwoFingerTap {
+                        started_at: self.started_at,
+                        max_move_sq: self.max_move_sq,
+                    });
                 }
             }
             _ => {}
@@ -280,6 +384,8 @@ impl<O: Output> State<O> {
                     last_centroid: centroid,
                     last_scale_emitted: 1.0,
                     last_angle: ang,
+                    scroll_velocity: (0.0, 0.0),
+                    last_scroll_time: None,
                 });
             }
             GestureKind::ThreeFingerLive | GestureKind::FourFingerLive => {
@@ -421,7 +527,23 @@ impl<O: Output> State<O> {
                 let ddx = centroid.0 - base.last_centroid.0;
                 let ddy = centroid.1 - base.last_centroid.1;
                 if ddx.abs() > MOTION_DEAD_ZONE_MM || ddy.abs() > MOTION_DEAD_ZONE_MM {
-                    log::debug!("scroll: d=({:+.3},{:+.3})mm", ddx, ddy);
+                    // EMA-track centroid velocity for the inertia seed.
+                    // Skip the very first sample (no prior time → no
+                    // meaningful dt); the next emit picks up the EMA.
+                    if let Some(prev_t) = base.last_scroll_time {
+                        let dt = (now - prev_t).as_secs_f64().max(1e-3);
+                        let inst_vx = ddx / dt;
+                        let inst_vy = ddy / dt;
+                        base.scroll_velocity.0 = SCROLL_VELOCITY_ALPHA * inst_vx
+                            + (1.0 - SCROLL_VELOCITY_ALPHA) * base.scroll_velocity.0;
+                        base.scroll_velocity.1 = SCROLL_VELOCITY_ALPHA * inst_vy
+                            + (1.0 - SCROLL_VELOCITY_ALPHA) * base.scroll_velocity.1;
+                    }
+                    base.last_scroll_time = Some(now);
+                    log::debug!(
+                        "scroll: d=({:+.3},{:+.3})mm v=({:+.0},{:+.0})mm/s",
+                        ddx, ddy, base.scroll_velocity.0, base.scroll_velocity.1,
+                    );
                     self.out.scroll(ddx, ddy, Phase::Changed);
                 }
             }
@@ -527,6 +649,14 @@ mod tests {
             self.log
                 .borrow_mut()
                 .push(format!("scroll {dx:.4} {dy:.4} {phase:?}"));
+        }
+        fn scroll_inertia(&self, vx: f64, vy: f64) {
+            self.log
+                .borrow_mut()
+                .push(format!("scroll_inertia {vx:.4} {vy:.4}"));
+        }
+        fn cancel_inertia(&self) {
+            self.log.borrow_mut().push("cancel_inertia".to_string());
         }
         fn pinch(&self, delta: f64, phase: Phase) {
             self.log
@@ -1013,6 +1143,58 @@ mod tests {
         );
     }
 
+    /// Scroll-end always seeds inertia with the EMA-smoothed velocity at
+    /// lift; the `Output` decides whether the seed is fast enough to coast.
+    /// Gesture-side responsibility: emit the call exactly once per
+    /// scroll session, after the matching `scroll(.., Ended)`.
+    #[test]
+    fn scroll_lift_seeds_inertia() {
+        let r = Recorder::default();
+        let mut s = State::new(&r);
+        let t0 = Instant::now();
+        // Two-finger pan moving 5 mm/16ms ≈ 312 mm/s — well above any
+        // sane seed threshold the Output side might apply.
+        s.on_frame_at(frame(&[(1, 0.4, 0.5), (2, 0.6, 0.5)]), t0);
+        s.on_frame_at(frame(&[(1, 0.4, 0.55), (2, 0.6, 0.55)]), at(t0, 16));
+        s.on_frame_at(frame(&[(1, 0.4, 0.6), (2, 0.6, 0.6)]), at(t0, 32));
+        s.on_frame_at(frame(&[(1, 0.4, 0.65), (2, 0.6, 0.65)]), at(t0, 48));
+        s.on_frame_at(frame(&[]), at(t0, 64));
+        let log = r.pop();
+        let inertia: Vec<&String> = log
+            .iter()
+            .filter(|l| l.starts_with("scroll_inertia"))
+            .collect();
+        assert_eq!(inertia.len(), 1, "expected one inertia seed ({log:?})");
+        // After 3 motion frames at +2.5 mm/16ms each, the EMA should be
+        // tracking somewhere near +156 mm/s on Y. Don't pin the exact
+        // value — EMA dynamics depend on how many samples land before
+        // lift — but we should at least see a non-trivial Y velocity
+        // and a near-zero X.
+        let line = inertia[0];
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let vx: f64 = parts[1].parse().unwrap();
+        let vy: f64 = parts[2].parse().unwrap();
+        assert!(vy.abs() > 50.0, "expected Y velocity > 50 mm/s, got {vy} ({line})");
+        assert!(vx.abs() < 50.0, "expected near-zero X velocity, got {vx} ({line})");
+    }
+
+    /// First contact after a fully-released gesture must cancel any
+    /// in-flight inertia coast — otherwise a tap on the pad would
+    /// "blend into" a fling instead of stopping it.
+    #[test]
+    fn new_touch_cancels_inertia() {
+        let r = Recorder::default();
+        let mut s = State::new(&r);
+        let t0 = Instant::now();
+        // Idle → 1F triggers cancel_inertia.
+        s.on_frame_at(frame(&[(1, 0.5, 0.5)]), t0);
+        let log = r.pop();
+        assert!(
+            log.iter().any(|l| l == "cancel_inertia"),
+            "expected cancel_inertia on first touch ({log:?})",
+        );
+    }
+
     /// 2F analogue of `small_drift_during_tap_does_not_move_cursor`. A
     /// brief two-finger tap with synchronized sub-mm centroid drift sits
     /// above PAN_LOCK_MM (0.4 mm) but below TAP_MAX_MOVE_MM (1.0 mm), so
@@ -1056,6 +1238,106 @@ mod tests {
         assert!(
             log.iter().any(|l| l.contains("click Right")),
             "right-click should still fire on lift ({log:?})",
+        );
+    }
+
+    /// 2F tap where the two fingers don't lift in the same frame —
+    /// captured from a real device trace where one finger went tip=false
+    /// at t=65 ms and the other at t=77 ms (12 ms gap, well within human
+    /// release tolerance). Pre-fix the engine treated the residual 12 ms
+    /// of 1F as a fresh single-finger tap and fired Left; the fix
+    /// recognizes the residual as the tail of the 2F lift sequence and
+    /// fires Right (or, if the residual sits past the tap window,
+    /// nothing).
+    #[test]
+    fn two_finger_tap_with_split_lift_fires_right_not_left() {
+        let r = Recorder::default();
+        let mut s = State::new(&r);
+        let t0 = Instant::now();
+        let one = |id, x, y, tip| Contact { id, x, y, tip, confidence: true };
+        let two = |a: Contact, b: Contact| Frame {
+            contacts: vec![a, b],
+            scan_time_100us: 0,
+            button: false,
+        };
+        let single = |c: Contact| Frame {
+            contacts: vec![c],
+            scan_time_100us: 0,
+            button: false,
+        };
+        // t=0: id=0 lands.
+        s.on_frame_at(single(one(0, 15.53, 35.84, true)), t0);
+        // t=19: id=1 lands → 2F.
+        s.on_frame_at(
+            two(one(0, 15.53, 35.84, true), one(1, 31.80, 29.50, true)),
+            at(t0, 19),
+        );
+        // t=50: still 2F.
+        s.on_frame_at(
+            two(one(0, 15.50, 35.84, true), one(1, 31.80, 29.50, true)),
+            at(t0, 50),
+        );
+        // t=65: id=0 goes tip=false (still appears in report). The
+        // engine sees 1 active contact → transitions to OneFinger and
+        // stashes the pending right-click.
+        s.on_frame_at(
+            two(one(0, 15.50, 35.84, false), one(1, 31.80, 29.50, true)),
+            at(t0, 65),
+        );
+        // t=77: id=1 also lifts. OneFinger → Idle consumes the pending
+        // right-click.
+        s.on_frame_at(single(one(1, 31.80, 29.50, false)), at(t0, 77));
+
+        let log = r.pop();
+        assert!(
+            log.iter().any(|l| l.contains("click Right")),
+            "split-lift 2F tap should fire Right ({log:?})",
+        );
+        assert!(
+            !log.iter().any(|l| l.contains("click Left")),
+            "split-lift 2F tap must not also fire Left ({log:?})",
+        );
+    }
+
+    /// If the residual 1F finger sits past the original 2F tap window,
+    /// the right-click is no longer eligible — and crucially, the
+    /// residual must not fall through to fire its own left-click, since
+    /// it's still part of the 2F lift sequence (the user didn't intend
+    /// a 1F tap).
+    #[test]
+    fn two_finger_tap_with_long_residual_fires_nothing() {
+        let r = Recorder::default();
+        let mut s = State::new(&r);
+        let t0 = Instant::now();
+        let one = |id, x, y, tip| Contact { id, x, y, tip, confidence: true };
+        let two = |a: Contact, b: Contact| Frame {
+            contacts: vec![a, b],
+            scan_time_100us: 0,
+            button: false,
+        };
+        let single = |c: Contact| Frame {
+            contacts: vec![c],
+            scan_time_100us: 0,
+            button: false,
+        };
+        s.on_frame_at(single(one(0, 20.0, 30.0, true)), t0);
+        s.on_frame_at(
+            two(one(0, 20.0, 30.0, true), one(1, 35.0, 30.0, true)),
+            at(t0, 20),
+        );
+        // First finger lifts at t=80 (still 2F-tap-eligible).
+        s.on_frame_at(
+            two(one(0, 20.0, 30.0, false), one(1, 35.0, 30.0, true)),
+            at(t0, 80),
+        );
+        // Residual 1F holds stationary until t=400 — past the 220 ms
+        // total window measured from the 2F start.
+        s.on_frame_at(single(one(1, 35.0, 30.0, false)), at(t0, 400));
+
+        let log = r.pop();
+        assert!(
+            !log.iter().any(|l| l.starts_with("click")),
+            "long residual must fire neither Right nor Left ({log:?})",
         );
     }
 }

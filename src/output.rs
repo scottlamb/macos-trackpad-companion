@@ -10,6 +10,13 @@
 
 #![allow(non_upper_case_globals)]
 
+use core_foundation::base::TCFType;
+use core_foundation::date::CFAbsoluteTimeGetCurrent;
+use core_foundation::runloop::{CFRunLoop, kCFRunLoopDefaultMode};
+use core_foundation_sys::runloop::{
+    CFRunLoopAddTimer, CFRunLoopTimerContext, CFRunLoopTimerCreate, CFRunLoopTimerInvalidate,
+    CFRunLoopTimerRef,
+};
 use core_graphics::geometry::CGPoint;
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -27,6 +34,31 @@ const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 /// guard, a click → drift → click sequence would still register as
 /// double-click when it should reset to 1.
 const DOUBLE_CLICK_DISTANCE_PX: f64 = 5.0;
+
+/// Inertia / coast tunables.
+///
+/// Modeled on rmk's `TrackpadProcessor`: an EMA-smoothed velocity sampled
+/// during active scroll seeds an exponential decay after the user lifts.
+/// The values aren't a direct port — rmk works in chip units per chip
+/// cycle, and we work in mm/s with a wall-clock timer — but the wall-clock
+/// half-life and stop time roughly match.
+///
+/// `MOMENTUM_TICK_HZ` drives the CFRunLoopTimer that posts momentum-phase
+/// scroll events while coasting. 60 Hz is the natural cadence for
+/// momentum-aware UIs and keeps each event small enough to feel smooth.
+const MOMENTUM_TICK_HZ: f64 = 60.0;
+const MOMENTUM_TICK_INTERVAL: f64 = 1.0 / MOMENTUM_TICK_HZ;
+/// Per-second velocity decay multiplier during coast. 0.05 means velocity
+/// drops to 5% of its lift value over one second — wall-clock half-life
+/// of ~230 ms, full-stop within ~1 s for a typical flick. Tweak by ear.
+const MOMENTUM_DECAY_PER_SEC: f64 = 0.05;
+/// Speed below which momentum stops emitting (mm/s). Anything smaller
+/// would round to under a pixel per tick at the default scroll_accel
+/// and just look like jitter trailing off.
+const MOMENTUM_STOP_MM_PER_SEC: f64 = 5.0;
+/// Speed required at scroll-end to seed inertia (mm/s). Avoids "ghost"
+/// coasts from a slow drag that the user wasn't trying to fling.
+const MOMENTUM_SEED_MM_PER_SEC: f64 = 25.0;
 
 // ---------- Public CGEvent constants (mirrored from CGEventTypes.h) ----------
 
@@ -50,6 +82,12 @@ const kCGMouseEventClickState: u32 = 1;
 const kCGMouseEventDeltaX: u32 = 35;
 const kCGMouseEventDeltaY: u32 = 36;
 
+// Public scroll-event fields (CGEventTypes.h).
+const kCGScrollWheelEventPointDeltaAxis1: u32 = 96;
+const kCGScrollWheelEventPointDeltaAxis2: u32 = 97;
+const kCGScrollWheelEventFixedPtDeltaAxis1: u32 = 93;
+const kCGScrollWheelEventFixedPtDeltaAxis2: u32 = 94;
+const kCGScrollWheelEventIsContinuous: u32 = 88;
 // Public scroll-phase fields (in CGEventTypes.h since macOS 10.7).
 const kCGScrollWheelEventScrollPhase: u32 = 99;
 const kCGScrollWheelEventMomentumPhase: u32 = 123;
@@ -156,6 +194,11 @@ pub struct Config {
     pub accel: f64,
     /// Screen pixels emitted per millimeter of finger motion in scroll mode.
     pub scroll_accel: f64,
+    /// Natural scrolling: finger-down on the pad scrolls content down on
+    /// the screen (the macOS default since 10.7). False for the legacy
+    /// "wheel" convention where finger-down moves the scrollbar down /
+    /// the content up.
+    pub natural_scroll: bool,
     /// Allow private gesture-event injection. If false, pinch/rotate/swipe
     /// are no-ops (or fall back to keyboard shortcuts where sensible).
     pub private_gestures: bool,
@@ -196,6 +239,16 @@ pub trait Output {
     fn move_cursor_by(&self, dx_mm: f64, dy_mm: f64);
     fn click(&self, button: MouseButton);
     fn scroll(&self, dx_mm: f64, dy_mm: f64, phase: Phase);
+    /// Seed scroll inertia from a just-ended pan. `vx_mm_per_sec` and
+    /// `vy_mm_per_sec` are the EMA-smoothed centroid velocity at lift.
+    /// Implementation drives a self-paced momentum-phase scroll stream
+    /// that decays to zero. Called once per scroll session, after the
+    /// final `scroll(.., Phase::Ended)`.
+    fn scroll_inertia(&self, vx_mm_per_sec: f64, vy_mm_per_sec: f64);
+    /// Cancel an in-flight inertia coast (typically because a new touch
+    /// landed). Implementations should bracket the cancellation with a
+    /// `MomentumPhase::Ended` event so apps stop their scroll animations.
+    fn cancel_inertia(&self);
     fn pinch(&self, delta: f64, phase: Phase);
     fn rotate(&self, delta_degrees: f64, phase: Phase);
     fn swipe(&self, direction: SwipeDirection);
@@ -212,6 +265,43 @@ pub struct Emitter {
     /// entirely on this field.
     last_click: Cell<Option<(MouseButton, Instant, CGPoint)>>,
     click_count: Cell<i64>,
+    /// Sub-pixel carry for active scroll, by axis. Each `scroll()` call's
+    /// f64 pixel value gets accumulated; the integer part drives the
+    /// CGEvent's PointDelta / wheel fields, and the fractional part rolls
+    /// over to the next event. Without this, integer truncation drops up
+    /// to one pixel per event, which on a 60+ Hz event stream is a
+    /// noticeable drift on slow scrolls.
+    scroll_carry_x_px: Cell<f64>,
+    scroll_carry_y_px: Cell<f64>,
+    /// Inertia state plus its CFRunLoopTimer. Boxed for a stable address
+    /// — the timer's C context holds a raw pointer back here. Allocated
+    /// once at `new()`; the timer ref inside is None except while a
+    /// coast is in flight.
+    momentum: Box<Momentum>,
+}
+
+/// Inertia state. All cells are accessed only from the main run loop
+/// thread (CFRunLoopTimer fires there), so `Cell` is sufficient.
+struct Momentum {
+    cfg: Config,
+    /// Most recent EMA velocity passed in via `scroll_inertia`, decayed
+    /// each tick. Zero between coasts.
+    vel_x_mm_per_sec: Cell<f64>,
+    vel_y_mm_per_sec: Cell<f64>,
+    /// Wall-clock time of the previous tick. Used to derive the per-tick
+    /// integration step `dt`; tolerates jitter in timer scheduling.
+    last_tick: Cell<Option<Instant>>,
+    /// Fractional-pixel carry for momentum-phase events (separate from
+    /// the active-scroll carry so a fresh coast doesn't inherit drift
+    /// from the lift).
+    carry_x_px: Cell<f64>,
+    carry_y_px: Cell<f64>,
+    /// Live timer ref while coasting. Null otherwise. Stored so
+    /// `cancel()` can invalidate it.
+    timer_ref: Cell<CFRunLoopTimerRef>,
+    /// True after `MomentumPhase::Began` has been posted for the current
+    /// coast; gates the corresponding `Ended` on cancel/stop.
+    began_posted: Cell<bool>,
 }
 
 impl Emitter {
@@ -220,6 +310,18 @@ impl Emitter {
             cfg,
             last_click: Cell::new(None),
             click_count: Cell::new(0),
+            scroll_carry_x_px: Cell::new(0.0),
+            scroll_carry_y_px: Cell::new(0.0),
+            momentum: Box::new(Momentum {
+                cfg,
+                vel_x_mm_per_sec: Cell::new(0.0),
+                vel_y_mm_per_sec: Cell::new(0.0),
+                last_tick: Cell::new(None),
+                carry_x_px: Cell::new(0.0),
+                carry_y_px: Cell::new(0.0),
+                timer_ref: Cell::new(std::ptr::null_mut()),
+                began_posted: Cell::new(false),
+            }),
         }
     }
 
@@ -297,24 +399,36 @@ impl Emitter {
     /// (Safari, Maps, etc.) can do rubber-banding and track the gesture
     /// as a continuous interaction rather than discrete wheel ticks.
     pub fn scroll(&self, dx_mm: f64, dy_mm: f64, phase: Phase) {
-        let dx = -dx_mm * self.cfg.scroll_accel;
-        let dy = -dy_mm * self.cfg.scroll_accel;
-        let Some(e) = Event::from_raw(unsafe {
-            CGEventCreateScrollWheelEvent2(
-                std::ptr::null_mut(),
-                kCGScrollEventUnitPixel,
-                2,
-                dy as i32,
-                dx as i32,
-                0,
-            )
-        }) else {
-            return;
-        };
-        e.set_int(kCGScrollWheelEventScrollPhase as u32, phase.mask());
-        e.set_int(kCGScrollWheelEventMomentumPhase as u32, PHASE_NONE);
-        log::trace!("post: scroll {:?} d=({:+.0},{:+.0})px", phase, dx, dy);
-        e.post();
+        let sign = if self.cfg.natural_scroll { 1.0 } else { -1.0 };
+        let dx_px = sign * dx_mm * self.cfg.scroll_accel;
+        let dy_px = sign * dy_mm * self.cfg.scroll_accel;
+        // Reset sub-pixel carry on Began so a stale fraction from the
+        // previous gesture doesn't surface on the first event.
+        if matches!(phase, Phase::Began) {
+            self.scroll_carry_x_px.set(0.0);
+            self.scroll_carry_y_px.set(0.0);
+        }
+        let total_x = self.scroll_carry_x_px.get() + dx_px;
+        let total_y = self.scroll_carry_y_px.get() + dy_px;
+        let int_x = total_x.trunc() as i32;
+        let int_y = total_y.trunc() as i32;
+        self.scroll_carry_x_px.set(total_x - int_x as f64);
+        self.scroll_carry_y_px.set(total_y - int_y as f64);
+        post_scroll_event(int_x, int_y, dx_px, dy_px, phase, /* momentum */ Phase::Cancelled);
+    }
+
+    /// Seed inertia from the just-ended pan. Cancels any in-flight coast
+    /// and starts a new one driven by a CFRunLoopTimer.
+    pub fn scroll_inertia(&self, vx_mm_per_sec: f64, vy_mm_per_sec: f64) {
+        let sign = if self.cfg.natural_scroll { 1.0 } else { -1.0 };
+        // Apply direction sign here so the Momentum struct doesn't have
+        // to know about natural_scroll — it just integrates a velocity.
+        self.momentum.start(sign * vx_mm_per_sec, sign * vy_mm_per_sec);
+    }
+
+    /// Cancel any in-flight inertia. No-op if not coasting.
+    pub fn cancel_inertia(&self) {
+        self.momentum.cancel();
     }
 
     /// Emit a pinch (magnify) gesture. `delta` is the *change* in scale
@@ -391,6 +505,202 @@ impl Emitter {
         self.gesture_bracket(false);
     }
 
+}
+
+/// Post a single phased scroll event. Exactly one of `scroll_phase` and
+/// `momentum_phase` should be `Some`; the other goes on the wire as
+/// `PHASE_NONE`. The integer pixel values drive line-equivalent and
+/// point-delta fields; the float values drive the high-precision
+/// `FixedPtDelta` field, so smooth-scroll-aware apps see sub-pixel
+/// motion that integer truncation would otherwise drop.
+fn post_scroll_event(
+    int_x_px: i32,
+    int_y_px: i32,
+    float_x_px: f64,
+    float_y_px: f64,
+    scroll_phase: Phase,
+    momentum_phase: Phase,
+) {
+    let Some(e) = Event::from_raw(unsafe {
+        CGEventCreateScrollWheelEvent2(
+            std::ptr::null_mut(),
+            kCGScrollEventUnitPixel,
+            2,
+            int_y_px,
+            int_x_px,
+            0,
+        )
+    }) else {
+        return;
+    };
+    let scroll_mask = match scroll_phase {
+        Phase::Cancelled => PHASE_NONE,
+        p => p.mask(),
+    };
+    let momentum_mask = match momentum_phase {
+        Phase::Cancelled => PHASE_NONE,
+        p => p.mask(),
+    };
+    e.set_int(kCGScrollWheelEventScrollPhase, scroll_mask);
+    e.set_int(kCGScrollWheelEventMomentumPhase, momentum_mask);
+    e.set_int(kCGScrollWheelEventIsContinuous, 1);
+    // High-precision deltas. Q16.16 fixed-point (1.0 == 0x10000), capped
+    // at i32 range. Apps that look at `scrollingDeltaY` (NSEvent) read
+    // the FixedPt value rather than the integer, so this keeps fractional
+    // pixels from disappearing on slow scrolls.
+    let fp_y = (float_y_px * 65536.0).clamp(i32::MIN as f64, i32::MAX as f64) as i64;
+    let fp_x = (float_x_px * 65536.0).clamp(i32::MIN as f64, i32::MAX as f64) as i64;
+    e.set_int(kCGScrollWheelEventFixedPtDeltaAxis1, fp_y);
+    e.set_int(kCGScrollWheelEventFixedPtDeltaAxis2, fp_x);
+    e.set_int(kCGScrollWheelEventPointDeltaAxis1, int_y_px as i64);
+    e.set_int(kCGScrollWheelEventPointDeltaAxis2, int_x_px as i64);
+    log::trace!(
+        "post: scroll s={:?} m={:?} px=({:+},{:+}) precise=({:+.2},{:+.2})",
+        scroll_phase, momentum_phase, int_x_px, int_y_px, float_x_px, float_y_px,
+    );
+    e.post();
+}
+
+impl Momentum {
+    /// Begin coasting at the given velocity. Cancels any in-flight coast
+    /// first so a quick re-flick replaces the seed cleanly.
+    fn start(&self, vx_mm_per_sec: f64, vy_mm_per_sec: f64) {
+        self.cancel();
+        let speed = (vx_mm_per_sec * vx_mm_per_sec + vy_mm_per_sec * vy_mm_per_sec).sqrt();
+        if speed < MOMENTUM_SEED_MM_PER_SEC {
+            log::debug!(
+                "scroll: inertia skipped (speed={:.0}mm/s below seed threshold {:.0})",
+                speed, MOMENTUM_SEED_MM_PER_SEC,
+            );
+            return;
+        }
+        self.vel_x_mm_per_sec.set(vx_mm_per_sec);
+        self.vel_y_mm_per_sec.set(vy_mm_per_sec);
+        self.last_tick.set(None);
+        self.carry_x_px.set(0.0);
+        self.carry_y_px.set(0.0);
+        self.began_posted.set(false);
+        let mut ctx = CFRunLoopTimerContext {
+            version: 0,
+            info: self as *const Momentum as *mut c_void,
+            retain: None,
+            release: None,
+            copyDescription: None,
+        };
+        let now_abs = unsafe { CFAbsoluteTimeGetCurrent() };
+        let timer = unsafe {
+            CFRunLoopTimerCreate(
+                std::ptr::null_mut(),
+                now_abs + MOMENTUM_TICK_INTERVAL,
+                MOMENTUM_TICK_INTERVAL,
+                0,
+                0,
+                momentum_tick,
+                &mut ctx,
+            )
+        };
+        if timer.is_null() {
+            log::warn!("scroll: CFRunLoopTimerCreate returned NULL; inertia disabled");
+            return;
+        }
+        unsafe {
+            CFRunLoopAddTimer(
+                CFRunLoop::get_current().as_concrete_TypeRef() as *mut _,
+                timer,
+                kCFRunLoopDefaultMode,
+            );
+        }
+        self.timer_ref.set(timer);
+        log::debug!(
+            "scroll: inertia started v=({:+.0},{:+.0})mm/s",
+            vx_mm_per_sec, vy_mm_per_sec,
+        );
+    }
+
+    /// Stop coasting (if active), post a momentum-Ended bracket so apps
+    /// can finalize their scroll animation, and release the timer.
+    fn cancel(&self) {
+        let t = self.timer_ref.replace(std::ptr::null_mut());
+        if t.is_null() {
+            return;
+        }
+        unsafe {
+            CFRunLoopTimerInvalidate(t);
+            CFRelease(t as *const c_void);
+        }
+        self.vel_x_mm_per_sec.set(0.0);
+        self.vel_y_mm_per_sec.set(0.0);
+        self.last_tick.set(None);
+        self.carry_x_px.set(0.0);
+        self.carry_y_px.set(0.0);
+        if self.began_posted.replace(false) {
+            post_scroll_event(0, 0, 0.0, 0.0, Phase::Cancelled, Phase::Ended);
+        }
+        log::debug!("scroll: inertia cancelled");
+    }
+
+    /// One timer tick: integrate velocity over the elapsed interval,
+    /// post a momentum-phase event if the integer-pixel quantum is
+    /// non-zero, decay the velocity, and stop if we're below the
+    /// stop threshold.
+    fn tick(&self) {
+        let now = Instant::now();
+        let dt = match self.last_tick.replace(Some(now)) {
+            Some(prev) => (now - prev).as_secs_f64().clamp(0.001, 0.1),
+            None => MOMENTUM_TICK_INTERVAL,
+        };
+
+        // Decay velocity exponentially toward zero. `MOMENTUM_DECAY_PER_SEC`
+        // is the multiplier per second; scale to dt with `^dt`.
+        let factor = MOMENTUM_DECAY_PER_SEC.powf(dt);
+        let vx = self.vel_x_mm_per_sec.get() * factor;
+        let vy = self.vel_y_mm_per_sec.get() * factor;
+        self.vel_x_mm_per_sec.set(vx);
+        self.vel_y_mm_per_sec.set(vy);
+
+        let speed = (vx * vx + vy * vy).sqrt();
+        if speed < MOMENTUM_STOP_MM_PER_SEC {
+            self.cancel();
+            return;
+        }
+
+        // Integrate to per-tick pixel displacement.
+        let dx_px = vx * dt * self.cfg.scroll_accel;
+        let dy_px = vy * dt * self.cfg.scroll_accel;
+        let total_x = self.carry_x_px.get() + dx_px;
+        let total_y = self.carry_y_px.get() + dy_px;
+        let int_x = total_x.trunc() as i32;
+        let int_y = total_y.trunc() as i32;
+        self.carry_x_px.set(total_x - int_x as f64);
+        self.carry_y_px.set(total_y - int_y as f64);
+
+        let phase = if self.began_posted.replace(true) {
+            Phase::Changed
+        } else {
+            Phase::Began
+        };
+        post_scroll_event(int_x, int_y, dx_px, dy_px, Phase::Cancelled, phase);
+    }
+}
+
+extern "C" fn momentum_tick(_timer: CFRunLoopTimerRef, info: *mut c_void) {
+    // Safety: `info` was set to `&Momentum` in `Momentum::start`, the
+    // Momentum lives in a Box owned by the Emitter, and the Emitter's
+    // Drop invalidates the timer before the Box is dropped. So the
+    // pointer is live for every callback.
+    let m = unsafe { &*(info as *const Momentum) };
+    m.tick();
+}
+
+impl Drop for Emitter {
+    fn drop(&mut self) {
+        // Invalidate the timer before the Momentum box is dropped so
+        // an in-flight callback can't dereference a freed pointer.
+        self.momentum.cancel();
+    }
+}
+
+impl Emitter {
     fn gesture_bracket(&self, begin: bool) {
         if let Some(e) = Event::new() {
             e.set_type(if begin {
@@ -419,6 +729,12 @@ impl Output for Emitter {
     }
     fn scroll(&self, dx_mm: f64, dy_mm: f64, phase: Phase) {
         Emitter::scroll(self, dx_mm, dy_mm, phase);
+    }
+    fn scroll_inertia(&self, vx_mm_per_sec: f64, vy_mm_per_sec: f64) {
+        Emitter::scroll_inertia(self, vx_mm_per_sec, vy_mm_per_sec);
+    }
+    fn cancel_inertia(&self) {
+        Emitter::cancel_inertia(self);
     }
     fn pinch(&self, delta: f64, phase: Phase) {
         Emitter::pinch(self, delta, phase);
