@@ -162,14 +162,48 @@ const kCGScrollWheelEventIsContinuous: u32 = 88;
 const kCGScrollWheelEventScrollPhase: u32 = 99;
 const kCGScrollWheelEventMomentumPhase: u32 = 123;
 
-// NSEventPhase values (macOS public, but only exposed via NSEvent — same
-// integer constants apply to CGEvent's scroll-phase and the private
-// gesture-phase field).
-const PHASE_NONE: i64 = 0;
+// NSEventPhase values (macOS public, exposed via NSEvent.phase). Used for
+// the private gesture-phase field on pinch/rotate/swipe events, which the
+// OS bridges directly to NSEvent.phase. Note: the *scroll*-phase and
+// *momentum*-phase fields on a CGScrollWheelEvent use *different* enums
+// (CGScrollPhase / CGMomentumScrollPhase) — see `cg_scroll_phase` and
+// `cg_momentum_phase` below.
 const PHASE_BEGAN: i64 = 1;
 const PHASE_CHANGED: i64 = 4;
 const PHASE_ENDED: i64 = 8;
 const PHASE_CANCELLED: i64 = 16;
+
+/// Translate a `Phase` to the integer value `kCGScrollWheelEventScrollPhase`
+/// expects. That field uses `CGScrollPhase`, **not** `NSEventPhase`:
+/// began=1, changed=2, ended=4, cancelled=8. Posting NSEventPhase values
+/// here means apps see e.g. our "Changed" (NSEvent=4) as CGScrollPhase
+/// `Ended`, and Chrome / terminal-style scroll consumers immediately
+/// terminate the gesture instead of tracking motion. AppKit translates
+/// CGScrollPhase → NSEventPhase when it builds an NSEvent for delivery,
+/// so writing the CG values is what matches real trackpads on the wire.
+fn cg_scroll_phase(phase: Phase) -> i64 {
+    match phase {
+        Phase::Began => 1,
+        Phase::Changed => 2,
+        Phase::Ended => 4,
+        Phase::Cancelled => 0, // sentinel: caller used Cancelled to mean "no scroll phase"
+    }
+}
+
+/// Translate a `Phase` to the integer value
+/// `kCGScrollWheelEventMomentumPhase` expects. That field uses
+/// `CGMomentumScrollPhase` (sequential, not bit-flags): none=0, begin=1,
+/// continue=2, end=3. Inertia in `Momentum::tick` posts a Began once
+/// then Changed-Changed-…; the latter must map to `continue`, and the
+/// final Ended (or our momentum-cancel post) maps to `end`.
+fn cg_momentum_phase(phase: Phase) -> i64 {
+    match phase {
+        Phase::Began => 1,
+        Phase::Changed => 2,
+        Phase::Ended => 3,
+        Phase::Cancelled => 0, // sentinel: caller used Cancelled to mean "no momentum phase"
+    }
+}
 
 // ---------- Private gesture event types (NSEvent → CGEvent mapping) ----------
 //
@@ -232,7 +266,11 @@ impl Event {
     }
 
     fn from_raw(raw: CGEventRef) -> Option<Self> {
-        if raw.is_null() { None } else { Some(Event(raw)) }
+        if raw.is_null() {
+            None
+        } else {
+            Some(Event(raw))
+        }
     }
 
     fn set_type(&self, ty: u32) {
@@ -401,8 +439,7 @@ struct Momentum {
 
 impl Emitter {
     pub fn new(cfg: Config) -> Self {
-        let event_source =
-            unsafe { CGEventSourceCreate(kCGEventSourceStateCombinedSessionState) };
+        let event_source = unsafe { CGEventSourceCreate(kCGEventSourceStateCombinedSessionState) };
         if event_source.is_null() {
             log::warn!(
                 "CGEventSourceCreate(combinedSessionState) returned NULL; \
@@ -457,16 +494,29 @@ impl Emitter {
         // below stay at the user's requested value so apps see "pushing past
         // the edge" intent.
         let bounds = display_bounds_for(from);
-        p.x = p.x.clamp(bounds.origin.x, bounds.origin.x + bounds.size.width - 1.0);
-        p.y = p.y.clamp(bounds.origin.y, bounds.origin.y + bounds.size.height - 1.0);
+        p.x =
+            p.x.clamp(bounds.origin.x, bounds.origin.x + bounds.size.width - 1.0);
+        p.y =
+            p.y.clamp(bounds.origin.y, bounds.origin.y + bounds.size.height - 1.0);
         let Some(e) = Event::from_raw(unsafe {
-            CGEventCreateMouseEvent(std::ptr::null_mut(), kCGEventMouseMoved, p, kCGMouseButtonLeft)
+            CGEventCreateMouseEvent(
+                std::ptr::null_mut(),
+                kCGEventMouseMoved,
+                p,
+                kCGMouseButtonLeft,
+            )
         }) else {
             return;
         };
         e.set_int(kCGMouseEventDeltaX as u32, dx as i64);
         e.set_int(kCGMouseEventDeltaY as u32, dy as i64);
-        log::trace!("post: mouseMoved d=({:+.1},{:+.1})px to=({:.0},{:.0})", dx, dy, p.x, p.y);
+        log::trace!(
+            "post: mouseMoved d=({:+.1},{:+.1})px to=({:.0},{:.0})",
+            dx,
+            dy,
+            p.x,
+            p.y
+        );
         e.post();
     }
 
@@ -493,12 +543,23 @@ impl Emitter {
         self.last_click.set(Some((button, now, p)));
 
         let (down, up, raw_button) = match button {
-            MouseButton::Left => (kCGEventLeftMouseDown, kCGEventLeftMouseUp, kCGMouseButtonLeft),
-            MouseButton::Right => (kCGEventRightMouseDown, kCGEventRightMouseUp, kCGMouseButtonRight),
+            MouseButton::Left => (
+                kCGEventLeftMouseDown,
+                kCGEventLeftMouseUp,
+                kCGMouseButtonLeft,
+            ),
+            MouseButton::Right => (
+                kCGEventRightMouseDown,
+                kCGEventRightMouseUp,
+                kCGMouseButtonRight,
+            ),
         };
         log::debug!(
             "post: click {:?} count={} at=({:.0},{:.0})",
-            button, count, p.x, p.y,
+            button,
+            count,
+            p.x,
+            p.y,
         );
         if let Some(e) = Event::from_raw(unsafe {
             CGEventCreateMouseEvent(std::ptr::null_mut(), down, p, raw_button)
@@ -546,6 +607,9 @@ impl Emitter {
         let int_y = total_y.trunc() as i32;
         self.scroll_carry_x_px.set(total_x - int_x as f64);
         self.scroll_carry_y_px.set(total_y - int_y as f64);
+        if matches!(phase, Phase::Changed) && int_x == 0 && int_y == 0 {
+            return;
+        }
         post_scroll_event(
             self.event_source,
             int_x,
@@ -563,7 +627,8 @@ impl Emitter {
         let sign = if self.cfg.natural_scroll { 1.0 } else { -1.0 };
         // Apply direction sign here so the Momentum struct doesn't have
         // to know about natural_scroll — it just integrates a velocity.
-        self.momentum.start(sign * vx_mm_per_sec, sign * vy_mm_per_sec);
+        self.momentum
+            .start(sign * vx_mm_per_sec, sign * vy_mm_per_sec);
     }
 
     /// Cancel any in-flight inertia. Returns `true` if a coast was
@@ -622,7 +687,10 @@ impl Emitter {
     /// discrete navigation event (Safari back/forward, etc.).
     pub fn swipe(&self, direction: SwipeDirection) {
         if !self.cfg.private_gestures {
-            log::debug!("post: swipe {:?} suppressed (private_gestures=false)", direction);
+            log::debug!(
+                "post: swipe {:?} suppressed (private_gestures=false)",
+                direction
+            );
             return;
         }
         log::debug!("post: swipe {:?}", direction);
@@ -645,7 +713,6 @@ impl Emitter {
         }
         self.gesture_bracket(false);
     }
-
 }
 
 /// Post a single phased scroll event. Exactly one of `scroll_phase` and
@@ -671,25 +738,14 @@ fn post_scroll_event(
     momentum_phase: Phase,
 ) {
     let Some(e) = Event::from_raw(unsafe {
-        CGEventCreateScrollWheelEvent2(
-            source,
-            kCGScrollEventUnitPixel,
-            2,
-            int_y_px,
-            int_x_px,
-            0,
-        )
+        CGEventCreateScrollWheelEvent2(source, kCGScrollEventUnitPixel, 2, int_y_px, int_x_px, 0)
     }) else {
         return;
     };
-    let scroll_mask = match scroll_phase {
-        Phase::Cancelled => PHASE_NONE,
-        p => p.mask(),
-    };
-    let momentum_mask = match momentum_phase {
-        Phase::Cancelled => PHASE_NONE,
-        p => p.mask(),
-    };
+    // `Phase::Cancelled` is the sentinel for "this field is unused on this
+    // event"; cg_*_phase encodes that as 0 (none).
+    let scroll_mask = cg_scroll_phase(scroll_phase);
+    let momentum_mask = cg_momentum_phase(momentum_phase);
     e.set_int(kCGScrollWheelEventScrollPhase, scroll_mask);
     e.set_int(kCGScrollWheelEventMomentumPhase, momentum_mask);
     e.set_int(kCGScrollWheelEventIsContinuous, 1);
@@ -705,7 +761,12 @@ fn post_scroll_event(
     e.set_int(kCGScrollWheelEventPointDeltaAxis2, int_x_px as i64);
     log::trace!(
         "post: scroll s={:?} m={:?} px=({:+},{:+}) precise=({:+.2},{:+.2})",
-        scroll_phase, momentum_phase, int_x_px, int_y_px, float_x_px, float_y_px,
+        scroll_phase,
+        momentum_phase,
+        int_x_px,
+        int_y_px,
+        float_x_px,
+        float_y_px,
     );
     e.post_to(kCGSessionEventTap);
 }
@@ -719,7 +780,8 @@ impl Momentum {
         if speed < MOMENTUM_SEED_MM_PER_SEC {
             log::debug!(
                 "scroll: inertia skipped (speed={:.0}mm/s below seed threshold {:.0})",
-                speed, MOMENTUM_SEED_MM_PER_SEC,
+                speed,
+                MOMENTUM_SEED_MM_PER_SEC,
             );
             return;
         }
@@ -762,7 +824,8 @@ impl Momentum {
         self.timer_ref.set(timer);
         log::debug!(
             "scroll: inertia started v=({:+.0},{:+.0})mm/s",
-            vx_mm_per_sec, vy_mm_per_sec,
+            vx_mm_per_sec,
+            vy_mm_per_sec,
         );
     }
 
@@ -786,7 +849,10 @@ impl Momentum {
         if self.began_posted.replace(false) {
             post_scroll_event(
                 self.event_source,
-                0, 0, 0.0, 0.0,
+                0,
+                0,
+                0.0,
+                0.0,
                 Phase::Cancelled,
                 Phase::Ended,
             );
@@ -840,7 +906,10 @@ impl Momentum {
         };
         post_scroll_event(
             self.event_source,
-            int_x, int_y, dx_px, dy_px,
+            int_x,
+            int_y,
+            dx_px,
+            dy_px,
             Phase::Cancelled,
             phase,
         );
