@@ -795,20 +795,29 @@ impl Emitter {
         let mut p = from;
         p.x += dx;
         p.y += dy;
-        // Clamp the *event location* to the bounds of the display the cursor
-        // started on. The auto-hidden full-screen menu bar reveals only while
-        // the cursor sits at the menu-bar display's top edge (y == origin.y);
-        // a real input device hits that edge naturally because the OS won't
-        // let it leave the screen, but a CGEvent posted at y < origin.y just
-        // visually clamps the cursor without firing the reveal. The same
-        // logic applies to Dock auto-reveal at the bottom edge. Delta fields
+        // If the proposed point lands off every display, clamp it to the
+        // bounds of the source display so the *event location* sits exactly
+        // on the edge. The auto-hidden full-screen menu bar reveals only
+        // while the cursor sits at the menu-bar display's top edge (y ==
+        // origin.y); a real input device hits that edge naturally because
+        // the OS won't let it leave the screen, but a CGEvent posted at
+        // y < origin.y just visually clamps the cursor without firing the
+        // reveal. Same for Dock auto-reveal at the bottom edge. Delta fields
         // below stay at the user's requested value so apps see "pushing past
-        // the edge" intent.
-        let bounds = display_bounds_for(from);
-        p.x =
-            p.x.clamp(bounds.origin.x, bounds.origin.x + bounds.size.width - 1.0);
-        p.y =
-            p.y.clamp(bounds.origin.y, bounds.origin.y + bounds.size.height - 1.0);
+        // the edge" intent. When the proposed point lands on *any* display
+        // (e.g. crossing to an adjacent monitor), post it as-is — clamping
+        // to the source display's bounds would pin the cursor at the source
+        // display's edge and prevent multi-monitor traversal entirely.
+        let on_a_display = CGDisplay::displays_with_point(p, 1)
+            .map(|(ids, _)| !ids.is_empty())
+            .unwrap_or(false);
+        if !on_a_display {
+            let bounds = display_bounds_for(from);
+            p.x =
+                p.x.clamp(bounds.origin.x, bounds.origin.x + bounds.size.width - 1.0);
+            p.y =
+                p.y.clamp(bounds.origin.y, bounds.origin.y + bounds.size.height - 1.0);
+        }
         let Some(e) = Event::from_raw(unsafe {
             CGEventCreateMouseEvent(
                 std::ptr::null_mut(),
