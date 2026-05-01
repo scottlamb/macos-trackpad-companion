@@ -60,6 +60,41 @@ const MOMENTUM_STOP_MM_PER_SEC: f64 = 5.0;
 /// coasts from a slow drag that the user wasn't trying to fling.
 const MOMENTUM_SEED_MM_PER_SEC: f64 = 25.0;
 
+/// Power-curve acceleration for scroll, modeled on `smooth_scroll.swift`'s
+/// `acceleratePixels`. Real trackpads (and Mac Mouse Fix / LinearMouse)
+/// expose this kind of curve because uniform `pixels = mm × accel` feels
+/// too linear: slow scrolls overshoot if accel is high enough for flicks
+/// to feel responsive, and flicks feel sluggish if accel is low enough
+/// for slow scrolls to stay precise. The exponent boosts faster motion
+/// disproportionately, giving Apple-style "high initial velocity, clear
+/// deceleration" feel without sacrificing slow-scroll precision.
+///
+/// Curve: `pixels_per_sec = sign(v) × LINEAR × |v|^EXPONENT`, calibrated
+/// so the curve passes through the linear value `scroll_accel × v` at
+/// `v == REF_MM_PER_SEC` (i.e. crosses the linear feel at "typical"
+/// scroll speed). Below the reference, curve is sub-linear → slow
+/// motion is slower than linear. Above it, super-linear → fast motion
+/// gets amplified.
+const SCROLL_CURVE_EXPONENT: f64 = 1.3;
+/// Reference velocity (mm/s). At this velocity, the curve's pixel rate
+/// equals `scroll_accel × velocity`; ~1 mm per chip frame on a 60 Hz
+/// pad, which feels "typical" to the user during deliberate panning.
+const SCROLL_CURVE_REF_MM_PER_SEC: f64 = 60.0;
+
+/// Apply the scroll-acceleration curve to a velocity, returning pixels
+/// per second. Caller multiplies by per-tick `dt` for the per-tick
+/// pixel delta.
+fn accelerate_scroll(v_mm_per_sec: f64, scroll_accel: f64) -> f64 {
+    let mag = v_mm_per_sec.abs();
+    if mag == 0.0 {
+        return 0.0;
+    }
+    // LINEAR = scroll_accel × REF^(1 - EXPONENT). At v == REF this gives
+    // pixels_per_sec = scroll_accel × REF (matches linear feel).
+    let linear = scroll_accel * SCROLL_CURVE_REF_MM_PER_SEC.powf(1.0 - SCROLL_CURVE_EXPONENT);
+    v_mm_per_sec.signum() * linear * mag.powf(SCROLL_CURVE_EXPONENT)
+}
+
 // ---------- Public CGEvent constants (mirrored from CGEventTypes.h) ----------
 
 const kCGEventLeftMouseDown: u32 = 1;
@@ -73,7 +108,28 @@ const kCGMouseButtonRight: u32 = 1;
 
 const kCGScrollEventUnitPixel: u32 = 0;
 
+/// Event tap location for scroll events. The HID tap (0) sits below the
+/// gesture-engine and AppleMultitouchHIDService — events injected there
+/// can be filtered or merged into a multitouch device's own gesture
+/// state, which on this firmware (matched by AppleMultitouchHIDService
+/// on its `(0xFF60, 0x07)` HID usage) means our scroll posts get
+/// silently absorbed. The session tap (1) sits one level up, post-HID
+/// and pre-annotation: the path real trackpads' events take. Matches
+/// `smooth_scroll.swift`'s `.cgSessionEventTap` choice.
+const kCGSessionEventTap: u32 = 1;
+/// Default for non-scroll events (mouse moves, clicks, gestures); these
+/// have been working fine on the HID tap and the session-tap risk isn't
+/// worth taking.
 const kCGHIDEventTap: u32 = 0;
+
+/// `kCGEventSourceStateCombinedSessionState` from `CGEventSource.h`.
+/// A source created with this state behaves like a real input device
+/// (per Apple docs: "represents the combined state of all event sources
+/// in the user session"), so apps that gate trackpad-only behaviors —
+/// notably Chrome's rubber-band bounce in WebKit/Blink — accept our
+/// events as a "fling" worth animating. A null source (what
+/// `CGEventCreateScrollWheelEvent2` accepts) reads as synthetic.
+const kCGEventSourceStateCombinedSessionState: i32 = 0;
 
 /// `kCGMouseEventClickState` — the click count (1, 2, 3, …) macOS
 /// uses to decide whether to deliver a double/triple-click. Synthetic
@@ -145,6 +201,7 @@ unsafe extern "C" {
     fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
     fn CGEventSetDoubleValueField(event: CGEventRef, field: u32, value: f64);
     fn CGEventPost(tap: u32, event: CGEventRef);
+    fn CGEventSourceCreate(state: i32) -> CGEventSourceRef;
     fn CFRelease(cf: *const c_void);
 }
 
@@ -175,6 +232,9 @@ impl Event {
     }
     fn post(&self) {
         unsafe { CGEventPost(kCGHIDEventTap, self.0) };
+    }
+    fn post_to(&self, tap: u32) {
+        unsafe { CGEventPost(tap, self.0) };
     }
 }
 
@@ -256,6 +316,12 @@ pub trait Output {
 
 pub struct Emitter {
     cfg: Config,
+    /// Persistent CGEventSource. Created with
+    /// `kCGEventSourceStateCombinedSessionState` so apps see our scroll
+    /// events as coming from a real input device — Chrome / WebKit
+    /// gates rubber-band bounce on this. Held for the lifetime of the
+    /// emitter; released on Drop.
+    event_source: CGEventSourceRef,
     /// Most recent click that produced a CGEvent post: button + time +
     /// cursor location. The next click checks this to decide its
     /// `kCGMouseEventClickState` value — same button, within
@@ -273,6 +339,11 @@ pub struct Emitter {
     /// noticeable drift on slow scrolls.
     scroll_carry_x_px: Cell<f64>,
     scroll_carry_y_px: Cell<f64>,
+    /// Wall-clock time of the most recent `scroll()` call. Used to derive
+    /// per-frame `dt` so the acceleration curve can run on velocity
+    /// (mm/s) rather than raw per-frame mm — keeps feel consistent
+    /// across pad frame rates.
+    scroll_last_time: Cell<Option<Instant>>,
     /// Inertia state plus its CFRunLoopTimer. Boxed for a stable address
     /// — the timer's C context holds a raw pointer back here. Allocated
     /// once at `new()`; the timer ref inside is None except while a
@@ -284,6 +355,12 @@ pub struct Emitter {
 /// thread (CFRunLoopTimer fires there), so `Cell` is sufficient.
 struct Momentum {
     cfg: Config,
+    /// Same persistent CGEventSource the Emitter holds. Aliased here
+    /// (not retained separately) because the timer callback needs to
+    /// post events but doesn't have the Emitter handy. Lifetime is the
+    /// Emitter's — Drop invalidates the timer before releasing the
+    /// source so the callback can't dangle.
+    event_source: CGEventSourceRef,
     /// Most recent EMA velocity passed in via `scroll_inertia`, decayed
     /// each tick. Zero between coasts.
     vel_x_mm_per_sec: Cell<f64>,
@@ -306,14 +383,25 @@ struct Momentum {
 
 impl Emitter {
     pub fn new(cfg: Config) -> Self {
+        let event_source =
+            unsafe { CGEventSourceCreate(kCGEventSourceStateCombinedSessionState) };
+        if event_source.is_null() {
+            log::warn!(
+                "CGEventSourceCreate(combinedSessionState) returned NULL; \
+                 scroll bounce-back may not engage in WebKit / Chrome"
+            );
+        }
         Self {
             cfg,
+            event_source,
             last_click: Cell::new(None),
             click_count: Cell::new(0),
             scroll_carry_x_px: Cell::new(0.0),
             scroll_carry_y_px: Cell::new(0.0),
+            scroll_last_time: Cell::new(None),
             momentum: Box::new(Momentum {
                 cfg,
+                event_source,
                 vel_x_mm_per_sec: Cell::new(0.0),
                 vel_y_mm_per_sec: Cell::new(0.0),
                 last_tick: Cell::new(None),
@@ -398,23 +486,44 @@ impl Emitter {
     /// Phased smooth-pixel scroll. `phase` brackets the gesture so apps
     /// (Safari, Maps, etc.) can do rubber-banding and track the gesture
     /// as a continuous interaction rather than discrete wheel ticks.
+    /// Per-frame mm is converted to mm/s via wall-clock dt so the
+    /// acceleration curve runs on a frame-rate-independent velocity.
     pub fn scroll(&self, dx_mm: f64, dy_mm: f64, phase: Phase) {
         let sign = if self.cfg.natural_scroll { 1.0 } else { -1.0 };
-        let dx_px = sign * dx_mm * self.cfg.scroll_accel;
-        let dy_px = sign * dy_mm * self.cfg.scroll_accel;
-        // Reset sub-pixel carry on Began so a stale fraction from the
-        // previous gesture doesn't surface on the first event.
+        let now = Instant::now();
+        // Reset per-stroke state on Began. Carry would otherwise leak a
+        // fraction-of-a-pixel from the previous stroke; `scroll_last_time`
+        // would inflate dt across the gap between strokes and corrupt the
+        // first Changed event's velocity.
         if matches!(phase, Phase::Began) {
             self.scroll_carry_x_px.set(0.0);
             self.scroll_carry_y_px.set(0.0);
+            self.scroll_last_time.set(None);
         }
+        let prev_time = self.scroll_last_time.replace(Some(now));
+        let dt = match prev_time {
+            Some(t) => (now - t).as_secs_f64().clamp(0.001, 0.1),
+            None => 1.0 / 60.0,
+        };
+        let vx = dx_mm / dt;
+        let vy = dy_mm / dt;
+        let dx_px = sign * accelerate_scroll(vx, self.cfg.scroll_accel) * dt;
+        let dy_px = sign * accelerate_scroll(vy, self.cfg.scroll_accel) * dt;
         let total_x = self.scroll_carry_x_px.get() + dx_px;
         let total_y = self.scroll_carry_y_px.get() + dy_px;
         let int_x = total_x.trunc() as i32;
         let int_y = total_y.trunc() as i32;
         self.scroll_carry_x_px.set(total_x - int_x as f64);
         self.scroll_carry_y_px.set(total_y - int_y as f64);
-        post_scroll_event(int_x, int_y, dx_px, dy_px, phase, /* momentum */ Phase::Cancelled);
+        post_scroll_event(
+            self.event_source,
+            int_x,
+            int_y,
+            dx_px,
+            dy_px,
+            phase,
+            /* momentum */ Phase::Cancelled,
+        );
     }
 
     /// Seed inertia from the just-ended pan. Cancels any in-flight coast
@@ -508,12 +617,20 @@ impl Emitter {
 }
 
 /// Post a single phased scroll event. Exactly one of `scroll_phase` and
-/// `momentum_phase` should be `Some`; the other goes on the wire as
-/// `PHASE_NONE`. The integer pixel values drive line-equivalent and
-/// point-delta fields; the float values drive the high-precision
+/// `momentum_phase` should carry the active phase; the other goes on
+/// the wire as `PHASE_NONE` (encoded by passing `Phase::Cancelled` for
+/// the unused field). The integer pixel values drive line-equivalent
+/// and point-delta fields; the float values drive the high-precision
 /// `FixedPtDelta` field, so smooth-scroll-aware apps see sub-pixel
 /// motion that integer truncation would otherwise drop.
+///
+/// Posted to `kCGSessionEventTap` (not the HID tap) so
+/// AppleMultitouchHIDService doesn't merge the event into our PTP
+/// device's gesture state, and using the persistent
+/// combinedSessionState `source` so apps like Chrome accept this as a
+/// real-trackpad fling worthy of rubber-band bounce.
 fn post_scroll_event(
+    source: CGEventSourceRef,
     int_x_px: i32,
     int_y_px: i32,
     float_x_px: f64,
@@ -523,7 +640,7 @@ fn post_scroll_event(
 ) {
     let Some(e) = Event::from_raw(unsafe {
         CGEventCreateScrollWheelEvent2(
-            std::ptr::null_mut(),
+            source,
             kCGScrollEventUnitPixel,
             2,
             int_y_px,
@@ -558,7 +675,7 @@ fn post_scroll_event(
         "post: scroll s={:?} m={:?} px=({:+},{:+}) precise=({:+.2},{:+.2})",
         scroll_phase, momentum_phase, int_x_px, int_y_px, float_x_px, float_y_px,
     );
-    e.post();
+    e.post_to(kCGSessionEventTap);
 }
 
 impl Momentum {
@@ -634,7 +751,12 @@ impl Momentum {
         self.carry_x_px.set(0.0);
         self.carry_y_px.set(0.0);
         if self.began_posted.replace(false) {
-            post_scroll_event(0, 0, 0.0, 0.0, Phase::Cancelled, Phase::Ended);
+            post_scroll_event(
+                self.event_source,
+                0, 0, 0.0, 0.0,
+                Phase::Cancelled,
+                Phase::Ended,
+            );
         }
         log::debug!("scroll: inertia cancelled");
     }
@@ -664,9 +786,12 @@ impl Momentum {
             return;
         }
 
-        // Integrate to per-tick pixel displacement.
-        let dx_px = vx * dt * self.cfg.scroll_accel;
-        let dy_px = vy * dt * self.cfg.scroll_accel;
+        // Integrate to per-tick pixel displacement, applying the same
+        // power curve as the active-scroll path so the user feels a
+        // continuous deceleration from flick → coast (rather than a
+        // step at lift from "amplified" to "linear").
+        let dx_px = accelerate_scroll(vx, self.cfg.scroll_accel) * dt;
+        let dy_px = accelerate_scroll(vy, self.cfg.scroll_accel) * dt;
         let total_x = self.carry_x_px.get() + dx_px;
         let total_y = self.carry_y_px.get() + dy_px;
         let int_x = total_x.trunc() as i32;
@@ -679,7 +804,12 @@ impl Momentum {
         } else {
             Phase::Began
         };
-        post_scroll_event(int_x, int_y, dx_px, dy_px, Phase::Cancelled, phase);
+        post_scroll_event(
+            self.event_source,
+            int_x, int_y, dx_px, dy_px,
+            Phase::Cancelled,
+            phase,
+        );
     }
 }
 
@@ -696,7 +826,12 @@ impl Drop for Emitter {
     fn drop(&mut self) {
         // Invalidate the timer before the Momentum box is dropped so
         // an in-flight callback can't dereference a freed pointer.
+        // `cancel` may post a final MomentumPhase::Ended via the event
+        // source, so the source release has to come after.
         self.momentum.cancel();
+        if !self.event_source.is_null() {
+            unsafe { CFRelease(self.event_source as *const c_void) };
+        }
     }
 }
 
