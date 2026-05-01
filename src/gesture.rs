@@ -160,7 +160,7 @@ impl<O: Output> State<O> {
             self.transition(new_kind, &active, now);
         }
         if !active.is_empty() {
-            self.dispatch(&active);
+            self.dispatch(&active, now);
         }
     }
 
@@ -293,23 +293,42 @@ impl<O: Output> State<O> {
         }
     }
 
-    fn dispatch(&mut self, active: &[Contact]) {
+    fn dispatch(&mut self, active: &[Contact], now: Instant) {
         match self.kind {
             GestureKind::Idle | GestureKind::SwipeLatched => {}
-            GestureKind::OneFinger => self.dispatch_one(active),
+            GestureKind::OneFinger => self.dispatch_one(active, now),
             GestureKind::TwoFingerUnclassified
             | GestureKind::TwoFingerPan
             | GestureKind::TwoFingerPinch
-            | GestureKind::TwoFingerRotate => self.dispatch_two(active),
+            | GestureKind::TwoFingerRotate => self.dispatch_two(active, now),
             GestureKind::ThreeFingerLive | GestureKind::FourFingerLive => self.dispatch_swipe(active),
         }
     }
 
-    fn dispatch_one(&mut self, active: &[Contact]) {
+    fn dispatch_one(&mut self, active: &[Contact], now: Instant) {
         let c = active[0];
         let Some(tr) = self.contacts.get(&c.id) else {
             return;
         };
+
+        // Hold cursor motion until this touch is committed to "not a tap".
+        // Per-frame finger jitter inside the tap budget would otherwise
+        // drag the cursor away from where the user expected the click to
+        // land. The touch becomes cursor-eligible the moment its
+        // cumulative drift exceeds TAP_MAX_MOVE_MM or its duration exceeds
+        // TAP_MAX_DURATION — both checks live here (not just at lift)
+        // because a held-then-dragged finger should also start moving the
+        // cursor once the tap window closes. Pre-commit frames clear
+        // `pending_motion` so no stale buffered delta leaks out the
+        // moment we cross the threshold.
+        let max_move = tr.max_move_sq.sqrt();
+        let dur = now - self.started_at;
+        let could_still_tap = max_move < TAP_MAX_MOVE_MM && dur < TAP_MAX_DURATION;
+        if could_still_tap {
+            self.pending_motion = None;
+            return;
+        }
+
         let dx = tr.x - tr.prev_x;
         let dy = tr.y - tr.prev_y;
         // Emit the previous frame's deferred motion (if any), then
@@ -329,7 +348,7 @@ impl<O: Output> State<O> {
         self.pending_motion = Some((dx, dy));
     }
 
-    fn dispatch_two(&mut self, active: &[Contact]) {
+    fn dispatch_two(&mut self, active: &[Contact], now: Instant) {
         if active.len() != 2 {
             return;
         }
@@ -344,8 +363,25 @@ impl<O: Output> State<O> {
         let dist = (dx * dx + dy * dy).sqrt().max(1e-9);
         let ang = dy.atan2(dx);
 
-        // Lock mode if not yet locked.
+        // Lock mode if not yet locked. Same could-still-tap gate as
+        // dispatch_one: PAN_LOCK_MM (0.4) sits below TAP_MAX_MOVE_MM
+        // (1.0), so without this check a 2F tap with synchronized
+        // sub-mm centroid drift would lock pan mid-tap and start
+        // emitting scroll events — and the right-click would never
+        // fire on lift, since the kind would no longer be
+        // TwoFingerUnclassified. `self.max_move_sq` tracks the worst
+        // per-contact drift across the gesture, so it correctly gates
+        // on either finger crossing the tap budget.
         if matches!(self.kind, GestureKind::TwoFingerUnclassified) {
+            let max_move = self.max_move_sq.sqrt();
+            let dur = now - self.started_at;
+            let could_still_tap = max_move < TAP_MAX_MOVE_MM && dur < TAP_MAX_DURATION;
+            if could_still_tap {
+                base.last_centroid = centroid;
+                base.last_angle = ang;
+                self.two_baseline = Some(base);
+                return;
+            }
             let pan = ((centroid.0 - base.initial_centroid.0).powi(2)
                 + (centroid.1 - base.initial_centroid.1).powi(2))
             .sqrt()
@@ -855,19 +891,26 @@ mod tests {
         let r = Recorder::default();
         let mut s = State::new(&r);
         let t0 = Instant::now();
-        // Normal tracking motion at 0.25 mm/frame (0.005 of 50 mm pad).
+        // Open with motion well past TAP_MAX_MOVE_MM so the could-still-tap
+        // gate releases on frame 2 — otherwise no `move` lines emit and
+        // the assertion has nothing to check. Then steady 2.5 mm/frame of
+        // tracking motion before a 7.5 mm final-with-finger jump (the
+        // artifact this test exists to suppress).
         s.on_frame_at(frame(&[(1, 0.500, 0.500)]), t0);
-        s.on_frame_at(frame(&[(1, 0.505, 0.500)]), at(t0, 13));
-        s.on_frame_at(frame(&[(1, 0.510, 0.500)]), at(t0, 26));
-        // Final frame with finger reports a big centroid-shift jump (2.5 mm).
-        s.on_frame_at(frame(&[(1, 0.560, 0.500)]), at(t0, 39));
+        s.on_frame_at(frame(&[(1, 0.550, 0.500)]), at(t0, 13));
+        s.on_frame_at(frame(&[(1, 0.600, 0.500)]), at(t0, 26));
+        s.on_frame_at(frame(&[(1, 0.650, 0.500)]), at(t0, 39));
+        // Final with-finger frame: 7.5 mm jump.
+        s.on_frame_at(frame(&[(1, 0.800, 0.500)]), at(t0, 52));
         // Lift.
-        s.on_frame_at(frame(&[]), at(t0, 52));
+        s.on_frame_at(frame(&[]), at(t0, 65));
 
         let log = r.pop();
-        // Each emitted move dx should stay near the 0.25 mm/frame baseline;
-        // the 2.5 mm lift-frame jump must not surface. 0.5 mm splits the two.
-        for line in &log {
+        let moves: Vec<&String> = log.iter().filter(|l| l.starts_with("move ")).collect();
+        assert!(!moves.is_empty(), "test must emit some move lines to be meaningful: {log:?}");
+        // Tracking deltas are 2.5 mm; the lift-frame jump is 7.5 mm. A 5 mm
+        // ceiling separates the two — anything above is the artifact leaking.
+        for line in &moves {
             if let Some(rest) = line.strip_prefix("move ") {
                 let dx: f64 = rest
                     .split_whitespace()
@@ -875,7 +918,7 @@ mod tests {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0.0);
                 assert!(
-                    dx.abs() <= 0.5,
+                    dx.abs() <= 5.0,
                     "lift-frame centroid jump leaked into cursor ({line})",
                 );
             }
@@ -921,6 +964,98 @@ mod tests {
         assert!(
             !log.iter().any(|l| l.starts_with("move ")),
             "pre-scroll two-finger settling must not emit cursor motion ({log:?})",
+        );
+    }
+
+    /// Captures the user-reported regression: small finger drift during a
+    /// brisk tap (well inside both TAP_MAX_MOVE_MM = 1.0 and
+    /// TAP_MAX_DURATION = 220 ms) must not push the cursor before the
+    /// click lands. Pre-fix, per-frame deltas above MOTION_DEAD_ZONE_MM
+    /// (0.04 mm) leaked through `dispatch_one` even when the touch was
+    /// destined to resolve as a tap, so the click registered at a
+    /// shifted location. The could-still-tap gate in `dispatch_one`
+    /// holds cursor motion until the touch is committed to "not a tap".
+    #[test]
+    fn small_drift_during_tap_does_not_move_cursor() {
+        let r = Recorder::default();
+        let mut s = State::new(&r);
+        let t0 = Instant::now();
+        // Recreates the captured trace: ~0.13 mm total drift over 4
+        // frames, lift in 70 ms — clearly a tap, but per-frame Δy hovers
+        // at the dead-zone boundary. Note the helper is fed mm
+        // directly here (not [0,1] fractions) so the drift figures
+        // match the bug report 1:1.
+        let frame_at_mm = |x: f64, y: f64| Frame {
+            contacts: vec![Contact {
+                id: 0,
+                x,
+                y,
+                tip: true,
+                confidence: true,
+            }],
+            scan_time_100us: 0,
+            button: false,
+        };
+        s.on_frame_at(frame_at_mm(35.70, 39.04), t0);
+        s.on_frame_at(frame_at_mm(35.67, 39.02), at(t0, 17));
+        s.on_frame_at(frame_at_mm(35.65, 38.97), at(t0, 31));
+        s.on_frame_at(frame_at_mm(35.63, 38.93), at(t0, 47));
+        s.on_frame_at(Frame { contacts: vec![], scan_time_100us: 0, button: false }, at(t0, 70));
+
+        let log = r.pop();
+        assert!(
+            !log.iter().any(|l| l.starts_with("move ")),
+            "tap-eligible drift must not move cursor ({log:?})",
+        );
+        assert!(
+            log.iter().any(|l| l.contains("click Left")),
+            "tap should still fire ({log:?})",
+        );
+    }
+
+    /// 2F analogue of `small_drift_during_tap_does_not_move_cursor`. A
+    /// brief two-finger tap with synchronized sub-mm centroid drift sits
+    /// above PAN_LOCK_MM (0.4 mm) but below TAP_MAX_MOVE_MM (1.0 mm), so
+    /// pre-fix the lock branch would commit to TwoFingerPan and start
+    /// emitting scroll events — and the lift would no longer fire the
+    /// right-click (transition arm only checks for it from
+    /// TwoFingerUnclassified). The could-still-tap gate in
+    /// `dispatch_two` keeps the kind unclassified until the tap window
+    /// closes.
+    #[test]
+    fn small_drift_during_two_finger_tap_does_not_lock_or_scroll() {
+        let r = Recorder::default();
+        let mut s = State::new(&r);
+        let t0 = Instant::now();
+        // Both fingers drift ~0.5 mm in the same direction over four
+        // frames — centroid pan ~0.5 mm (above PAN_LOCK_MM = 0.4) but
+        // each finger's max_move ~0.5 mm (under TAP_MAX_MOVE_MM = 1.0).
+        let frame_at_mm = |a: (f64, f64), b: (f64, f64)| Frame {
+            contacts: vec![
+                Contact { id: 0, x: a.0, y: a.1, tip: true, confidence: true },
+                Contact { id: 1, x: b.0, y: b.1, tip: true, confidence: true },
+            ],
+            scan_time_100us: 0,
+            button: false,
+        };
+        s.on_frame_at(frame_at_mm((20.0, 30.0), (35.0, 30.0)), t0);
+        s.on_frame_at(frame_at_mm((20.15, 30.15), (35.15, 30.15)), at(t0, 17));
+        s.on_frame_at(frame_at_mm((20.30, 30.30), (35.30, 30.30)), at(t0, 34));
+        s.on_frame_at(frame_at_mm((20.45, 30.45), (35.45, 30.45)), at(t0, 51));
+        s.on_frame_at(Frame { contacts: vec![], scan_time_100us: 0, button: false }, at(t0, 75));
+
+        let log = r.pop();
+        assert!(
+            !log.iter().any(|l| l.starts_with("scroll")),
+            "tap-eligible 2F drift must not lock pan ({log:?})",
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("pinch") || l.starts_with("rotate")),
+            "tap-eligible 2F drift must not lock pinch/rotate ({log:?})",
+        );
+        assert!(
+            log.iter().any(|l| l.contains("click Right")),
+            "right-click should still fire on lift ({log:?})",
         );
     }
 }
