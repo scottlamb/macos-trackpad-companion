@@ -87,7 +87,16 @@ struct Walker<'a> {
     current_finger_block: Option<FingerBlockBuilder>,
     scan_time: Option<FieldRef>,
     contact_count: Option<FieldRef>,
-    button: Option<FieldRef>,
+    /// Button 0x01 fields keyed by the report id they belong to. PTP
+    /// descriptors commonly include a sibling Mouse TLC (e.g. Microsoft's
+    /// reference, RMK's firmware) which also declares Button 0x01 in its
+    /// own report — capturing the first such field across the whole
+    /// descriptor would store a `bit_offset` valid only for the Mouse
+    /// report, then apply it to the Touchpad report at decode time
+    /// (where that offset typically lands inside finger 0's confidence
+    /// bit). Resolution to a single field happens at `into_layout` once
+    /// `touch_report_id` is known.
+    buttons: HashMap<u8, FieldRef>,
     logical_x_max: Option<i32>,
     logical_y_max: Option<i32>,
 }
@@ -139,7 +148,7 @@ impl<'a> Walker<'a> {
             current_finger_block: None,
             scan_time: None,
             contact_count: None,
-            button: None,
+            buttons: HashMap::new(),
             logical_x_max: None,
             logical_y_max: None,
         }
@@ -308,7 +317,11 @@ impl<'a> Walker<'a> {
                     self.contact_count.get_or_insert(field);
                 }
                 (PAGE_BUTTON, 0x01) => {
-                    self.button.get_or_insert(field);
+                    // Record the field per-report-id; the touch report's
+                    // entry wins at `into_layout`. Don't fold sibling
+                    // Mouse-TLC buttons in here — their bit_offsets are
+                    // valid only for the Mouse report payload.
+                    self.buttons.entry(self.report_id).or_insert(field);
                 }
                 _ => {}
             }
@@ -395,8 +408,10 @@ impl<'a> Walker<'a> {
             .contact_count
             .ok_or_else(|| anyhow!("descriptor missing Contact Count field"))?;
         let button = self
-            .button
-            .ok_or_else(|| anyhow!("descriptor missing Button 1 field"))?;
+            .buttons
+            .get(&report_id)
+            .copied()
+            .ok_or_else(|| anyhow!("descriptor missing Button 1 field in touch report {report_id:#04x}"))?;
 
         let total_bits = self.bit_cursor.get(&report_id).copied().unwrap_or(0);
 
@@ -478,5 +493,71 @@ mod tests {
         assert_eq!(layout.logical_x_max, 3936);
         assert_eq!(layout.logical_y_max, 2424);
         assert_eq!(layout.total_payload_bytes, 35);
+    }
+
+    /// RMK's PTP firmware emits a sibling Mouse TLC (Report ID 0x01)
+    /// that also declares Button 0x01 / 0x02, *before* the Touchpad TLC
+    /// (Report ID 0x05). Earlier walker code stored the first Button 0x01
+    /// it saw via `get_or_insert`, capturing the Mouse TLC's bit_offset
+    /// (8, i.e. byte 1 bit 0 of the Mouse Report). At decode time that
+    /// offset was applied to the Touchpad Report and read finger 0's
+    /// confidence bit instead — every active touch decoded as
+    /// `button=true`. Regression test: Touchpad button must be at byte
+    /// 34 of the Touchpad report (after 5×6 fingers + scan_time +
+    /// contact_count), bit 0.
+    fn wpt_descriptor_with_mouse_tlc() -> Vec<u8> {
+        // ===== Mouse TLC (Report ID 0x01) — declares Button 0x01..0x02 =====
+        let mut d = vec![
+            0x05, 0x01,                         // Usage Page (Generic Desktop)
+            0x09, 0x02,                         // Usage (Mouse)
+            0xA1, 0x01,                         // Collection (Application)
+                0x85, 0x01,                         //   Report ID (1)
+                0x09, 0x01,                         //   Usage (Pointer)
+                0xA1, 0x00,                         //   Collection (Physical)
+                    0x05, 0x09, 0x19, 0x01, 0x29, 0x02, 0x15, 0x00, 0x25, 0x01,
+                    0x75, 0x01, 0x95, 0x02, 0x81, 0x02,     // 2 buttons (1 bit each)
+                    0x95, 0x06, 0x81, 0x03,                 // 6 bits padding
+                    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7F,
+                    0x75, 0x08, 0x95, 0x02, 0x81, 0x06,     // 2x 8-bit X/Y deltas
+                0xC0,
+            0xC0,
+        ];
+
+        // ===== Touchpad TLC (Report ID 0x05) — five fingers + scan + count + button =====
+        d.extend_from_slice(&[0x05, 0x0D, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x05]);
+        for _ in 0..5 {
+            d.extend_from_slice(&[
+                0x05, 0x0D, 0x09, 0x22, 0xA1, 0x02, 0x09, 0x47, 0x09, 0x42, 0x15, 0x00, 0x25, 0x01,
+                0x75, 0x01, 0x95, 0x02, 0x81, 0x02, 0x95, 0x06, 0x81, 0x03, 0x75, 0x08, 0x09, 0x51,
+                0x95, 0x01, 0x81, 0x02, 0x05, 0x01, 0x26, 0x60, 0x0F, 0x75, 0x10, 0x55, 0x0E, 0x65,
+                0x11, 0x09, 0x30, 0x35, 0x00, 0x46, 0x8A, 0x02, 0x95, 0x01, 0x81, 0x02, 0x46, 0x90,
+                0x01, 0x26, 0x78, 0x09, 0x09, 0x31, 0x81, 0x02, 0xC0,
+            ]);
+        }
+        d.extend_from_slice(&[
+            0x05, 0x0D, 0x55, 0x0C, 0x66, 0x01, 0x10, 0x47, 0xFF, 0xFF, 0x00, 0x00, 0x27, 0xFF,
+            0xFF, 0x00, 0x00, 0x75, 0x10, 0x95, 0x01, 0x09, 0x56, 0x81, 0x02, 0x09, 0x54, 0x25,
+            0x7F, 0x95, 0x01, 0x75, 0x08, 0x81, 0x02, 0x05, 0x09, 0x09, 0x01, 0x25, 0x01, 0x75,
+            0x01, 0x95, 0x01, 0x81, 0x02, 0x95, 0x07, 0x81, 0x03, 0xC0,
+        ]);
+        d
+    }
+
+    #[test]
+    fn touch_report_button_wins_over_sibling_mouse_button() {
+        let desc = wpt_descriptor_with_mouse_tlc();
+        let layout = parse(&desc).expect("parse");
+        // We pick the Touchpad TLC (whose finger collections set
+        // touch_report_id) as the report we decode, and its button —
+        // not the Mouse TLC's earlier Button 0x01 — must populate
+        // the layout.
+        assert_eq!(layout.report_id, 0x05);
+        assert_eq!(layout.button_offset, 34);
+        assert_eq!(layout.button_bit, 0);
+        // Sanity: still parses the rest correctly.
+        assert_eq!(layout.contact_slots, 5);
+        assert_eq!(layout.fingers_offset, 1);
+        assert_eq!(layout.scan_time_offset, 31);
+        assert_eq!(layout.contact_count_offset, 33);
     }
 }
