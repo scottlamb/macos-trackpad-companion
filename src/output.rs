@@ -308,7 +308,11 @@ pub trait Output {
     /// Cancel an in-flight inertia coast (typically because a new touch
     /// landed). Implementations should bracket the cancellation with a
     /// `MomentumPhase::Ended` event so apps stop their scroll animations.
-    fn cancel_inertia(&self);
+    /// Returns `true` if a coast was actually live and got cancelled —
+    /// callers use this to flag the new touch as "born during coast"
+    /// (rmk-style) and suppress any tap derived from it: the user
+    /// reached in to stop the fling, not to click.
+    fn cancel_inertia(&self) -> bool;
     fn pinch(&self, delta: f64, phase: Phase);
     fn rotate(&self, delta_degrees: f64, phase: Phase);
     fn swipe(&self, direction: SwipeDirection);
@@ -535,9 +539,10 @@ impl Emitter {
         self.momentum.start(sign * vx_mm_per_sec, sign * vy_mm_per_sec);
     }
 
-    /// Cancel any in-flight inertia. No-op if not coasting.
-    pub fn cancel_inertia(&self) {
-        self.momentum.cancel();
+    /// Cancel any in-flight inertia. Returns `true` if a coast was
+    /// active (so the caller knows the touch was cancelling a fling).
+    pub fn cancel_inertia(&self) -> bool {
+        self.momentum.cancel()
     }
 
     /// Emit a pinch (magnify) gesture. `delta` is the *change* in scale
@@ -736,10 +741,11 @@ impl Momentum {
 
     /// Stop coasting (if active), post a momentum-Ended bracket so apps
     /// can finalize their scroll animation, and release the timer.
-    fn cancel(&self) {
+    /// Returns `true` if a coast was actually active.
+    fn cancel(&self) -> bool {
         let t = self.timer_ref.replace(std::ptr::null_mut());
         if t.is_null() {
-            return;
+            return false;
         }
         unsafe {
             CFRunLoopTimerInvalidate(t);
@@ -759,6 +765,7 @@ impl Momentum {
             );
         }
         log::debug!("scroll: inertia cancelled");
+        true
     }
 
     /// One timer tick: integrate velocity over the elapsed interval,
@@ -868,8 +875,8 @@ impl Output for Emitter {
     fn scroll_inertia(&self, vx_mm_per_sec: f64, vy_mm_per_sec: f64) {
         Emitter::scroll_inertia(self, vx_mm_per_sec, vy_mm_per_sec);
     }
-    fn cancel_inertia(&self) {
-        Emitter::cancel_inertia(self);
+    fn cancel_inertia(&self) -> bool {
+        Emitter::cancel_inertia(self)
     }
     fn pinch(&self, delta: f64, phase: Phase) {
         Emitter::pinch(self, delta, phase);

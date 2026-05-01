@@ -136,6 +136,23 @@ pub struct State<O: Output> {
     /// ~one chip cycle of cursor latency for not getting that jump.
     pending_motion: Option<(f64, f64)>,
     pending_two_finger_tap: Option<PendingTwoFingerTap>,
+    /// Set on `Idle → non-Idle` transitions when `Output::cancel_inertia`
+    /// reports a coast was actually live. Persists for the duration of
+    /// the new gesture session and suppresses any tap derived from it
+    /// (1F left, 2F right, deferred right via `pending_two_finger_tap`).
+    /// Mirrors rmk's `TouchSession::born_during_coast`: the touch's
+    /// purpose was to stop the fling, not to click. Cleared on the
+    /// next `… → Idle` transition.
+    born_during_coast: bool,
+    /// Set on any 2F-locked → OneFinger transition (pan, pinch, rotate,
+    /// or unclassified-but-not-tap-eligible). The residual 1F is the
+    /// tail of an asynchronous lift, not a fresh single-finger tap; the
+    /// next `OneFinger → Idle` must NOT fire a Left click. Cleared by
+    /// the consuming OneFinger close-out. Distinct from
+    /// `pending_two_finger_tap`, which carries a *deferred* right-click
+    /// from a tap-eligible 2F session — the suppress flag has no such
+    /// payload, it just blocks the residual's own click path.
+    suppress_one_finger_click: bool,
 }
 
 impl<O: Output> State<O> {
@@ -151,6 +168,8 @@ impl<O: Output> State<O> {
             multi_baseline: None,
             pending_motion: None,
             pending_two_finger_tap: None,
+            born_during_coast: false,
+            suppress_one_finger_click: false,
         }
     }
 
@@ -234,12 +253,22 @@ impl<O: Output> State<O> {
         // First contact after Idle cancels any in-flight scroll inertia.
         // `SwipeLatched → Idle → ...` doesn't count: a deliberate new
         // touch has to come from no-fingers, and the user wants their
-        // touch to stop a fling rather than blend into it.
+        // touch to stop a fling rather than blend into it. Record
+        // whether the cancel actually stopped a live coast so the new
+        // session is excluded from tap evaluation (rmk-style
+        // `born_during_coast`).
         if matches!(self.kind, GestureKind::Idle)
             && !matches!(new_kind, GestureKind::Idle | GestureKind::SwipeLatched)
         {
-            self.out.cancel_inertia();
+            if self.out.cancel_inertia() {
+                self.born_during_coast = true;
+                log::debug!("touch born during coast — suppressing taps for this session");
+            }
         }
+        // Snapshot before the close-out potentially clears it. We want
+        // the close-out's tap branches to see the flag the way they were
+        // when the lift came in.
+        let bc = self.born_during_coast;
         // Close out the old gesture.
         match self.kind {
             GestureKind::OneFinger => {
@@ -254,8 +283,14 @@ impl<O: Output> State<O> {
                 // joined by a third — back to a 2F gesture) must be
                 // discarded; the 2F lift sequence is over.
                 let pending_2f = self.pending_two_finger_tap.take();
+                let suppress_residual = std::mem::take(&mut self.suppress_one_finger_click);
                 if matches!(new_kind, GestureKind::Idle) {
-                    if let Some(p) = pending_2f {
+                    if bc {
+                        // Born during coast: nothing this session does
+                        // counts as a click. Whether the residual was
+                        // also a 2F-tail or a fresh 1F is irrelevant.
+                        log::debug!("1f lift, click suppressed (born during coast)");
+                    } else if let Some(p) = pending_2f {
                         // Residual 1F is the tail of an asynchronous 2F
                         // lift. Combine the 2F window/motion with the
                         // residual's to decide whether the right-click
@@ -277,6 +312,11 @@ impl<O: Output> State<O> {
                                 combined_max_move,
                             );
                         }
+                    } else if suppress_residual {
+                        // Residual 1F is the tail of a non-tap 2F (a
+                        // pan, pinch, rotate, or motion-disqualified
+                        // unclassified). User didn't intend a 1F tap.
+                        log::debug!("1f lift, click suppressed (residual after 2f gesture)");
                     } else {
                         let dur = now - self.started_at;
                         let max_move = self.max_move_sq.sqrt();
@@ -315,21 +355,39 @@ impl<O: Output> State<O> {
                 // whether the seed is fast enough to coast on; gesture-side
                 // we always offer it.
                 self.out.scroll_inertia(vx, vy);
+                // Async lift: if one finger lifted before the other,
+                // the residual goes 2F-pan → 1F. That residual is the
+                // tail of the gesture, not a fresh tap.
+                if matches!(new_kind, GestureKind::OneFinger) {
+                    self.suppress_one_finger_click = true;
+                }
             }
             GestureKind::TwoFingerPinch => {
                 log::debug!("pinch: ended");
                 self.out.pinch(0.0, Phase::Ended);
+                if matches!(new_kind, GestureKind::OneFinger) {
+                    self.suppress_one_finger_click = true;
+                }
             }
             GestureKind::TwoFingerRotate => {
                 log::debug!("rotate: ended");
                 self.out.rotate(0.0, Phase::Ended);
+                if matches!(new_kind, GestureKind::OneFinger) {
+                    self.suppress_one_finger_click = true;
+                }
             }
             GestureKind::TwoFingerUnclassified => {
                 let dur = now - self.started_at;
                 let max_move = self.max_move_sq.sqrt();
                 let tap_eligible = dur < TAP_MAX_DURATION && max_move < TAP_MAX_MOVE_MM;
                 if matches!(new_kind, GestureKind::Idle) {
-                    if tap_eligible {
+                    if bc {
+                        log::debug!(
+                            "2f lift, click suppressed (born during coast; dur={}ms max_move={:.2}mm)",
+                            dur.as_millis(),
+                            max_move,
+                        );
+                    } else if tap_eligible {
                         log::debug!(
                             "2f tap: click Right (dur={}ms max_move={:.2}mm)",
                             dur.as_millis(),
@@ -343,20 +401,35 @@ impl<O: Output> State<O> {
                             max_move,
                         );
                     }
-                } else if matches!(new_kind, GestureKind::OneFinger) && tap_eligible {
-                    // One finger lifted while the 2F was still tap-eligible.
-                    // Stash the 2F window/motion so the next OneFinger → Idle
-                    // can fire the right-click; until then, the residual 1F
-                    // is part of this gesture, not a fresh 1F tap.
-                    log::debug!(
-                        "2f → 1f partial lift (dur={}ms max_move={:.2}mm); pending right-click",
-                        dur.as_millis(),
-                        max_move,
-                    );
-                    self.pending_two_finger_tap = Some(PendingTwoFingerTap {
-                        started_at: self.started_at,
-                        max_move_sq: self.max_move_sq,
-                    });
+                } else if matches!(new_kind, GestureKind::OneFinger) {
+                    if bc || !tap_eligible {
+                        // Either born during coast (no clicks at all
+                        // for this session) or the 2F window is already
+                        // disqualified for a tap (motion or duration
+                        // overshoot). Either way the residual 1F is
+                        // the tail of this gesture, not a fresh 1F tap.
+                        log::debug!(
+                            "2f → 1f partial lift (dur={}ms max_move={:.2}mm); suppressing residual click{}",
+                            dur.as_millis(),
+                            max_move,
+                            if bc { " (born during coast)" } else { "" },
+                        );
+                        self.suppress_one_finger_click = true;
+                    } else {
+                        // Tap-eligible 2F → 1F: stash the 2F window /
+                        // motion so the next OneFinger → Idle can fire
+                        // the right-click; until then, the residual 1F
+                        // is part of this gesture, not a fresh 1F tap.
+                        log::debug!(
+                            "2f → 1f partial lift (dur={}ms max_move={:.2}mm); pending right-click",
+                            dur.as_millis(),
+                            max_move,
+                        );
+                        self.pending_two_finger_tap = Some(PendingTwoFingerTap {
+                            started_at: self.started_at,
+                            max_move_sq: self.max_move_sq,
+                        });
+                    }
                 }
             }
             _ => {}
@@ -367,6 +440,13 @@ impl<O: Output> State<O> {
         self.max_move_sq = 0.0;
         self.two_baseline = None;
         self.multi_baseline = None;
+        // `born_during_coast` is a session-level flag. Clear it once
+        // the user has fully lifted; surviving gesture sub-transitions
+        // (e.g. OneFinger → TwoFingerUnclassified during a roll-on) is
+        // what keeps post-coast taps suppressed across kind changes.
+        if matches!(new_kind, GestureKind::Idle) {
+            self.born_during_coast = false;
+        }
 
         match new_kind {
             GestureKind::TwoFingerUnclassified if active.len() == 2 => {
@@ -630,11 +710,20 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         log: RefCell<Vec<String>>,
+        /// What `cancel_inertia` should report. Toggle on with
+        /// `set_inertia_active` to simulate "user touches the pad while
+        /// a fling is coasting"; the next `cancel_inertia` returns true
+        /// (just like the real Emitter would when its CFRunLoopTimer is
+        /// live) and clears the flag.
+        inertia_active: std::cell::Cell<bool>,
     }
 
     impl Recorder {
         fn pop(&self) -> Vec<String> {
             self.log.borrow_mut().drain(..).collect()
+        }
+        fn set_inertia_active(&self, active: bool) {
+            self.inertia_active.set(active);
         }
     }
 
@@ -655,8 +744,13 @@ mod tests {
                 .borrow_mut()
                 .push(format!("scroll_inertia {vx:.4} {vy:.4}"));
         }
-        fn cancel_inertia(&self) {
-            self.log.borrow_mut().push("cancel_inertia".to_string());
+        fn cancel_inertia(&self) -> bool {
+            let was_active = self.inertia_active.replace(false);
+            self.log.borrow_mut().push(format!(
+                "cancel_inertia{}",
+                if was_active { " (was_active)" } else { "" }
+            ));
+            was_active
         }
         fn pinch(&self, delta: f64, phase: Phase) {
             self.log
@@ -1190,8 +1284,122 @@ mod tests {
         s.on_frame_at(frame(&[(1, 0.5, 0.5)]), t0);
         let log = r.pop();
         assert!(
-            log.iter().any(|l| l == "cancel_inertia"),
+            log.iter().any(|l| l.starts_with("cancel_inertia")),
             "expected cancel_inertia on first touch ({log:?})",
+        );
+    }
+
+    /// rmk's `born_during_coast`: a 1F touch that lands while a fling
+    /// is coasting must cancel the inertia *and* be excluded from tap
+    /// evaluation on lift. The user reached in to stop the scroll, not
+    /// to click. Captures the user-reported regression where a stop-
+    /// the-fling tap fired a Left click.
+    #[test]
+    fn one_finger_tap_during_coast_does_not_click() {
+        let r = Recorder::default();
+        r.set_inertia_active(true);
+        let mut s = State::new(&r);
+        let t0 = Instant::now();
+        s.on_frame_at(frame(&[(1, 0.5, 0.5)]), t0);
+        s.on_frame_at(frame(&[(1, 0.5, 0.5)]), at(t0, 50));
+        s.on_frame_at(frame(&[]), at(t0, 80));
+        let log = r.pop();
+        assert!(
+            log.iter().any(|l| l.contains("cancel_inertia")),
+            "expected inertia cancellation on first touch ({log:?})",
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("click")),
+            "born-during-coast tap must not fire a click ({log:?})",
+        );
+    }
+
+    /// 2F-version: two fingers land during coast (e.g. user grabs the
+    /// pad to stop a fling), short and stationary. Must not fire Right.
+    #[test]
+    fn two_finger_tap_during_coast_does_not_click() {
+        let r = Recorder::default();
+        r.set_inertia_active(true);
+        let mut s = State::new(&r);
+        let t0 = Instant::now();
+        s.on_frame_at(frame(&[(1, 0.4, 0.5), (2, 0.6, 0.5)]), t0);
+        s.on_frame_at(frame(&[]), at(t0, 60));
+        let log = r.pop();
+        assert!(
+            !log.iter().any(|l| l.starts_with("click")),
+            "born-during-coast 2f tap must not fire a click ({log:?})",
+        );
+    }
+
+    /// After a fling stops normally (no touch), the next 1F tap should
+    /// resume firing clicks — `born_during_coast` is a per-session flag
+    /// and lift must clear it.
+    #[test]
+    fn one_finger_tap_after_coast_ends_naturally_fires_click() {
+        let r = Recorder::default();
+        // Inertia is NOT active for this touch (already decayed).
+        r.set_inertia_active(false);
+        let mut s = State::new(&r);
+        let t0 = Instant::now();
+        s.on_frame_at(frame(&[(1, 0.5, 0.5)]), t0);
+        s.on_frame_at(frame(&[]), at(t0, 80));
+        let log = r.pop();
+        assert!(
+            log.iter().any(|l| l.contains("click Left")),
+            "fresh 1f tap (no live coast) must still fire ({log:?})",
+        );
+    }
+
+    /// Async-lift after a 2F pan: contact 0 goes tip=false a frame
+    /// before contact 1, leaving a brief 1F residual. Pre-fix the
+    /// residual was treated as a fresh single-finger tap and fired
+    /// Left on lift. Captures the user-reported regression where
+    /// scrolling sometimes ended in an accidental Left click.
+    #[test]
+    fn async_lift_after_two_finger_pan_does_not_fire_click() {
+        let r = Recorder::default();
+        let mut s = State::new(&r);
+        let t0 = Instant::now();
+        let one = |id, x, y, tip| Contact { id, x, y, tip, confidence: true };
+        let two = |a: Contact, b: Contact| Frame {
+            contacts: vec![a, b],
+            scan_time_100us: 0,
+            button: false,
+        };
+        let single = |c: Contact| Frame {
+            contacts: vec![c],
+            scan_time_100us: 0,
+            button: false,
+        };
+        // Touchdown 2F.
+        s.on_frame_at(
+            two(one(0, 20.0, 30.0, true), one(1, 35.0, 30.0, true)),
+            t0,
+        );
+        // Scroll a clearly-not-a-tap distance to lock TwoFingerPan.
+        s.on_frame_at(
+            two(one(0, 20.0, 33.0, true), one(1, 35.0, 33.0, true)),
+            at(t0, 16),
+        );
+        s.on_frame_at(
+            two(one(0, 20.0, 36.0, true), one(1, 35.0, 36.0, true)),
+            at(t0, 32),
+        );
+        // Contact 0 lifts; contact 1 hangs around tip=true for one frame.
+        s.on_frame_at(
+            two(one(0, 20.0, 36.0, false), one(1, 35.0, 36.0, true)),
+            at(t0, 48),
+        );
+        // Contact 1 lifts.
+        s.on_frame_at(single(one(1, 35.0, 36.0, false)), at(t0, 60));
+        let log = r.pop();
+        assert!(
+            log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            "expected scroll to begin ({log:?})",
+        );
+        assert!(
+            !log.iter().any(|l| l.contains("click")),
+            "async-lift after 2f pan must not fire a click ({log:?})",
         );
     }
 
