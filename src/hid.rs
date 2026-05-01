@@ -445,18 +445,26 @@ unsafe extern "C" fn on_input_report(
             frame.button,
             frame.contacts,
         );
-    } else if log::log_enabled!(log::Level::Debug) && let Some(c) = frame.contacts.first() {
-        log::debug!(
-            "frame n={} c0 id={} raw=({:>4},{:>4}) norm=({:.3},{:.3}) tip={} button={}",
-            frame.contacts.len(),
-            c.id,
-            c.raw_x,
-            c.raw_y,
-            c.x,
-            c.y,
-            c.tip,
-            frame.button,
-        );
+    } else if log::log_enabled!(log::Level::Debug) {
+        // Always log a one-line debug summary, even for empty frames:
+        // `n=0` reports carry the lift transition (tip_switch=0 on the
+        // last touching contact), and the silence-on-empty version of
+        // this log made finger-up indistinguishable from the chip going
+        // idle.
+        match frame.contacts.first() {
+            Some(c) => log::debug!(
+                "frame n={} c0 id={} raw=({:>4},{:>4}) norm=({:.3},{:.3}) tip={} button={}",
+                frame.contacts.len(),
+                c.id,
+                c.raw_x,
+                c.raw_y,
+                c.x,
+                c.y,
+                c.tip,
+                frame.button,
+            ),
+            None => log::debug!("frame n=0 button={}", frame.button),
+        }
     }
     (bridge.on_frame)(frame);
 }
