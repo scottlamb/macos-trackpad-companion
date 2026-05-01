@@ -78,9 +78,18 @@ enum GestureKind {
 
 #[derive(Clone, Copy, Debug)]
 struct TwoFingerBaseline {
-    initial_centroid: (f64, f64),
     initial_distance: f64,
     initial_angle: f64,
+    /// Per-finger initial positions, keyed by contact ID so the lock
+    /// check can compute per-finger displacement (and the
+    /// common/differential motion decomposition) even if `active[0]`
+    /// and `active[1]` swap order between frames. The classifier needs
+    /// these to disqualify pan when one finger contributes most of the
+    /// motion: asymmetric pinch/rotate around a near-anchored finger
+    /// drifts the centroid as a *side effect* rather than as a real
+    /// pan signal.
+    initial_a: (u8, (f64, f64)),
+    initial_b: (u8, (f64, f64)),
     last_centroid: (f64, f64),
     last_scale_emitted: f64,
     last_angle: f64,
@@ -458,9 +467,10 @@ impl<O: Output> State<O> {
                 let dist = (dx * dx + dy * dy).sqrt().max(1e-9);
                 let ang = dy.atan2(dx);
                 self.two_baseline = Some(TwoFingerBaseline {
-                    initial_centroid: centroid,
                     initial_distance: dist,
                     initial_angle: ang,
+                    initial_a: (a.id, (a.x, a.y)),
+                    initial_b: (b.id, (b.x, b.y)),
                     last_centroid: centroid,
                     last_scale_emitted: 1.0,
                     last_angle: ang,
@@ -568,10 +578,41 @@ impl<O: Output> State<O> {
                 self.two_baseline = Some(base);
                 return;
             }
-            let pan = ((centroid.0 - base.initial_centroid.0).powi(2)
-                + (centroid.1 - base.initial_centroid.1).powi(2))
-            .sqrt()
-                / PAN_LOCK_MM;
+            // Decompose per-finger motion into common (centroid drift,
+            // a.k.a. pan) and differential (relative-motion, the
+            // pinch+rotate signal) components, looked up by contact ID
+            // so order swaps in `active` don't matter. Pan only locks
+            // if the common component strictly dominates the
+            // differential — otherwise the gesture is asymmetric
+            // pinch/rotate where one finger contributes most of the
+            // motion, and the centroid drift is a *side effect* of
+            // that asymmetry, not a real pan. Without this gate, an
+            // anchored-finger pinch (especially a slow one with
+            // contacts far apart, where 4% distance change in mm is
+            // larger than the 0.4mm pan threshold) locks pan before
+            // the distance ratio crosses `PINCH_LOCK_RATIO`. The
+            // strictly-greater comparison correctly rejects the
+            // boundary case of a fully-anchored finger
+            // (|common| = |differential|).
+            let (init_a, init_b) = if a.id == base.initial_a.0 {
+                (base.initial_a.1, base.initial_b.1)
+            } else {
+                (base.initial_b.1, base.initial_a.1)
+            };
+            let da = (a.x - init_a.0, a.y - init_a.1);
+            let db = (b.x - init_b.0, b.y - init_b.1);
+            let common = ((da.0 + db.0) * 0.5, (da.1 + db.1) * 0.5);
+            let differential = ((da.0 - db.0) * 0.5, (da.1 - db.1) * 0.5);
+            let common_mag = (common.0.powi(2) + common.1.powi(2)).sqrt();
+            let differential_mag =
+                (differential.0.powi(2) + differential.1.powi(2)).sqrt();
+            let pan_qualified = common_mag > differential_mag;
+
+            let pan = if pan_qualified {
+                common_mag / PAN_LOCK_MM
+            } else {
+                0.0
+            };
             let pinch = (dist / base.initial_distance - 1.0).abs() / PINCH_LOCK_RATIO;
             let rot = angle_delta(ang, base.initial_angle).abs() / ROTATE_LOCK_RAD;
             if pan >= 1.0 || pinch >= 1.0 || rot >= 1.0 {
@@ -865,6 +906,71 @@ mod tests {
         assert!(
             log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
             "{log:?}"
+        );
+    }
+
+    /// Anchored-finger pinch: one finger stays put while the other
+    /// moves toward it. Centroid drifts at half the moving finger's
+    /// rate, so a naive `pan > pinch` comparison would lock pan first
+    /// even when the user clearly intended a pinch (this was the
+    /// SoflePLUS2 hardware test failure that motivated the
+    /// common-vs-differential pan gate).
+    #[test]
+    fn asymmetric_pinch_locks_pinch_not_pan() {
+        let r = Recorder::default();
+        let mut s = State::new(&r);
+        // 50mm test pad. Contact 1 at (10,30), Contact 2 at (40,20) —
+        // distance ≈ 31.6 mm. Contact 1 stays anchored; Contact 2
+        // moves diagonally toward it. Before the fix, the centroid
+        // drift crossed PAN_LOCK_MM before the distance ratio crossed
+        // PINCH_LOCK_RATIO and pan locked. After the fix, an anchored
+        // finger gives `|common| = |differential|` exactly, so pan
+        // is disqualified and pinch wins.
+        s.on_frame(frame(&[(1, 0.2, 0.6), (2, 0.8, 0.4)]));
+        s.on_frame(frame(&[(1, 0.2, 0.6), (2, 0.76, 0.42)]));
+        s.on_frame(frame(&[(1, 0.2, 0.6), (2, 0.72, 0.44)]));
+        s.on_frame(frame(&[]));
+        let log = r.pop();
+        assert!(
+            log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            "expected pinch lock, got: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            "must not lock pan: {log:?}"
+        );
+    }
+
+    /// Asymmetric pinch where *both* fingers move (so a per-finger
+    /// `min_disp ≥ PAN_LOCK_MM` gate is not enough) but the
+    /// differential motion still dominates the centroid translation.
+    /// Reproduces the SoflePLUS2 hardware case from
+    /// /tmp/companion-logs.txt run 2: contacts at (3.11,41.32) and
+    /// (48.19,15.55) move to (3.78,40.12) and (47.83,15.89) by lock —
+    /// per-finger displacements of 1.37mm and 0.50mm (both > 0.4mm),
+    /// centroid drift 0.46mm vs. differential motion 0.92mm. The
+    /// `common > differential` gate disqualifies pan; pinch wins on
+    /// the next few frames as the distance ratio crosses threshold.
+    #[test]
+    fn asymmetric_pinch_with_minor_motion_on_anchor_finger_locks_pinch() {
+        let r = Recorder::default();
+        let mut s = State::new(&r);
+        // Coordinates chosen to be in mm directly via the 50mm test
+        // pad helper. Two contacts ~52mm apart along the diagonal.
+        s.on_frame(frame(&[(1, 0.062, 0.826), (2, 0.964, 0.311)]));
+        s.on_frame(frame(&[(1, 0.066, 0.812), (2, 0.961, 0.314)]));
+        s.on_frame(frame(&[(1, 0.071, 0.798), (2, 0.957, 0.318)]));
+        s.on_frame(frame(&[(1, 0.076, 0.802), (2, 0.939, 0.326)]));
+        s.on_frame(frame(&[(1, 0.084, 0.798), (2, 0.924, 0.331)]));
+        s.on_frame(frame(&[]));
+        let log = r.pop();
+        assert!(
+            log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            "expected pinch lock, got: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            "must not lock pan: {log:?}"
         );
     }
 
