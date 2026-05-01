@@ -162,17 +162,6 @@ const kCGScrollWheelEventIsContinuous: u32 = 88;
 const kCGScrollWheelEventScrollPhase: u32 = 99;
 const kCGScrollWheelEventMomentumPhase: u32 = 123;
 
-// NSEventPhase values (macOS public, exposed via NSEvent.phase). Used for
-// the private gesture-phase field on pinch/rotate/swipe events, which the
-// OS bridges directly to NSEvent.phase. Note: the *scroll*-phase and
-// *momentum*-phase fields on a CGScrollWheelEvent use *different* enums
-// (CGScrollPhase / CGMomentumScrollPhase) — see `cg_scroll_phase` and
-// `cg_momentum_phase` below.
-const PHASE_BEGAN: i64 = 1;
-const PHASE_CHANGED: i64 = 4;
-const PHASE_ENDED: i64 = 8;
-const PHASE_CANCELLED: i64 = 16;
-
 /// Translate a `Phase` to the integer value `kCGScrollWheelEventScrollPhase`
 /// expects. That field uses `CGScrollPhase`, **not** `NSEventPhase`:
 /// began=1, changed=2, ended=4, cancelled=8. Posting NSEventPhase values
@@ -205,28 +194,53 @@ fn cg_momentum_phase(phase: Phase) -> i64 {
     }
 }
 
-// ---------- Private gesture event types (NSEvent → CGEvent mapping) ----------
-//
-// These integer values match NSEventType. CGEvent accepts them when set
-// via CGEventSetType on a CGEventCreate(NULL) event, even though the
-// CGEventType enum doesn't expose them publicly. Used by BetterTouchTool,
-// Karabiner-Elements, MTMR, and others; stable on macOS 10.5+.
-const kCGEventGestureRotate: u32 = 18;
-const kCGEventGestureBegin: u32 = 19;
-const kCGEventGestureEnd: u32 = 20;
-const kCGEventGestureMagnify: u32 = 30;
-const kCGEventGestureSwipe: u32 = 31;
+/// Translate a `Phase` to the integer value the private gesture-event
+/// phase field (`FIELD_GESTURE_PHASE`, 132) expects. Despite NSEvent's
+/// public `phase` property being NSEventPhase (1/4/8/16 bit flags), the
+/// underlying CGEvent field on a private gesture event holds an
+/// `IOHIDEventPhaseBits` value: 1=Began, 2=Changed, 4=Ended, 8=Cancelled
+/// (sequential-ish, not bit flags). Confirmed via calftrail/Touch's
+/// `tl_CGEventCreateFromGesture` (which uses IOHIDEventPhaseBits) and
+/// Hammerspoon's `newGesture` (same). Setting NSEventPhase here produces
+/// events that NSMagnificationGestureRecognizer-using apps (Photos,
+/// Apple Maps) silently drop, even though the simpler
+/// NSResponder.magnify(with:) path may still react.
+fn iohid_gesture_phase(phase: Phase) -> u32 {
+    match phase {
+        Phase::Began => 1,
+        Phase::Changed => 2,
+        Phase::Ended => 4,
+        Phase::Cancelled => 8,
+    }
+}
 
-// Private CGEventField IDs (gesture event payload).
-const FIELD_GESTURE_SUBTYPE: u32 = 110;
-const FIELD_GESTURE_VALUE: u32 = 113;
-const FIELD_GESTURE_SWIPE_MASK: u32 = 115;
-const FIELD_GESTURE_PHASE: u32 = 132;
+/// Gesture subtype values. From calftrail/Touch's `TLInfoSubtype` enum
+/// (used by Hammerspoon's `tl_CGEventCreateFromGesture` and the older
+/// MultitouchSupport sources). The synthesizer writes this to CGEvent
+/// field 0x6E ("gestureSubtype") on the `NSEventTypeGesture` (29)
+/// wrapper.
+const GESTURE_SUBTYPE_ROTATE: u32 = 0x05;
+const GESTURE_SUBTYPE_MAGNIFY: u32 = 0x08;
+const GESTURE_SUBTYPE_SWIPE: u32 = 0x10;
+
+/// Magic CGEventFlags value calftrail's gesture synthesizer sets on the
+/// envelope event before serialization (`CGEventSetFlags(e, 256)`).
+/// `0x100` is `NX_NONCOALSESCEDMASK` in IOHIDSystem private headers —
+/// signals "do not collapse this with adjacent events of the same
+/// type". Without it, AppKit's gesture pipeline can drop our synthesized
+/// gesture events as duplicates of the surrounding (empty) HID stream.
+const GESTURE_EVENT_FLAGS: u64 = 0x100;
 
 // ---------- FFI ----------
 
 type CGEventRef = *mut c_void;
 type CGEventSourceRef = *mut c_void;
+
+#[repr(C)]
+struct CFRange {
+    location: i64,
+    length: i64,
+}
 
 unsafe extern "C" {
     fn CGEventCreate(source: CGEventSourceRef) -> CGEventRef;
@@ -246,12 +260,30 @@ unsafe extern "C" {
     ) -> CGEventRef;
     fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
     fn CGEventSetType(event: CGEventRef, ty: u32);
+    fn CGEventSetFlags(event: CGEventRef, flags: u64);
+    fn CGEventSetTimestamp(event: CGEventRef, ts: u64);
     fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
-    fn CGEventSetDoubleValueField(event: CGEventRef, field: u32, value: f64);
+    fn CGEventCreateData(allocator: *const c_void, event: CGEventRef) -> *mut c_void;
+    fn CGEventCreateFromData(allocator: *const c_void, data: *const c_void) -> CGEventRef;
     fn CGEventPost(tap: u32, event: CGEventRef);
     fn CGEventSourceCreate(state: i32) -> CGEventSourceRef;
     fn CFRelease(cf: *const c_void);
+    fn CFDataCreateMutableCopy(
+        allocator: *const c_void,
+        capacity: i64,
+        data: *const c_void,
+    ) -> *mut c_void;
+    fn CFDataAppendBytes(data: *mut c_void, bytes: *const u8, length: i64);
+    fn CFDataDeleteBytes(data: *mut c_void, range: CFRange);
+    fn CFDataGetLength(data: *const c_void) -> i64;
+    fn clock_gettime_nsec_np(clock_id: u32) -> u64;
 }
+
+/// `CLOCK_UPTIME_RAW` from `<time.h>` — monotonic nanoseconds since boot
+/// (does not advance during sleep). Same time base IOHID uses for its
+/// event timestamps, and what `tl_uptime()` in calftrail returns via
+/// the deprecated `AbsoluteToNanoseconds(UpTime())` path.
+const CLOCK_UPTIME_RAW: u32 = 8;
 
 struct Event(CGEventRef);
 
@@ -273,14 +305,8 @@ impl Event {
         }
     }
 
-    fn set_type(&self, ty: u32) {
-        unsafe { CGEventSetType(self.0, ty) };
-    }
     fn set_int(&self, field: u32, value: i64) {
         unsafe { CGEventSetIntegerValueField(self.0, field, value) };
-    }
-    fn set_dbl(&self, field: u32, value: f64) {
-        unsafe { CGEventSetDoubleValueField(self.0, field, value) };
     }
     fn post(&self) {
         unsafe { CGEventPost(kCGHIDEventTap, self.0) };
@@ -294,6 +320,302 @@ impl Drop for Event {
     fn drop(&mut self) {
         unsafe { CFRelease(self.0 as *const c_void) };
     }
+}
+
+// ---------- Calftrail-style gesture synthesizer ----------
+//
+// `CGEventCreate(NULL); SetType(30); Set(field, value); Post()` produces an
+// event AppKit's gesture-recognizer pipeline silently ignores: the
+// `NSMagnificationGestureRecognizer` consumed by Photos / Apple Maps wants
+// the event to carry an embedded IOHID payload (a digitizer-collection
+// event + vendor token + per-touch digitizer events), not just the
+// CGEvent fields. We can't get a properly-formed event from a public
+// API, so we build one by:
+//   1. asking CGEvent for the serialized form of an `NSEventTypeGesture`
+//      (type 29) wrapper,
+//   2. lopping off CGEvent's empty trailing field array,
+//   3. appending a hand-rolled `IOHIDSystemQueueElement` containing a
+//      digitizer-hand parent event and a vendor token,
+//   4. appending the gesture's CGEvent fields (subtype, IOHID phase,
+//      magnification/rotation/swipe value, plus the magic-zero fields
+//      AppKit's parser walks),
+//   5. and reconstituting via `CGEventCreateFromData`.
+// Original C is calftrail/Touch's `tl_CGEventCreateFromGesture`
+// (TouchSynthesis/TouchEvents.c); Hammerspoon's `newGesture` and
+// jitouch use the same recipe. The IOHID structs are public from
+// IOKit headers (IOHIDEventTypes.h / IOHIDEventData.h) but the
+// CGEvent serialization layout — the trailing 24-byte trim, the
+// {0x10,0x6D} marker, the BE field-encoding scheme, the magic
+// zero fields at 0x6F/0x70/0x85/0x8B/0x8C — is reverse-engineered
+// and undocumented.
+
+/// `NSEventTypeGesture` — base wrapper for all calftrail-style private
+/// gesture events. Subtype goes in field 0x6E.
+const kCGEventGesture: u32 = 29;
+
+const kIOHIDEventTypeVendorDefined: u32 = 1;
+const kIOHIDEventTypeDigitizer: u32 = 11;
+const kIOHIDEventOptionIsCollection: u32 = 0x02;
+const kIOHIDDigitizerTransducerTypeHand: u32 = 0x23;
+const kIOHIDDigitizerOrientationTypeQuality: u32 = 2;
+
+/// Mirrors `_IOHIDDigitizerEventData` from `IOHIDEventData.h`. Layout
+/// must match the C struct exactly: every field's offset and the total
+/// `size_of::<DigitizerEventData>()` are read directly by the OS when
+/// the appended bytes are demuxed back into events.
+#[repr(C)]
+struct DigitizerEventData {
+    size: u32,
+    ty: u32,
+    timestamp: u64,
+    options: u32,
+    position_x: i32, // IOFixed (Q16.16)
+    position_y: i32,
+    position_z: i32,
+    transducer_index: u32,
+    transducer_type: u32,
+    identity: u32,
+    event_mask: u32,
+    child_event_mask: u32,
+    button_mask: u32,
+    tip_pressure: i32,
+    barrel_pressure: i32,
+    twist: i32,
+    orientation_type: u32,
+    orientation_quality: i32,
+    orientation_density: i32,
+    orientation_irregularity: i32,
+    orientation_major_radius: i32,
+    orientation_minor_radius: i32,
+}
+
+/// Mirrors `_IOHIDVendorDefinedEventData`. The flexible `data[0]`
+/// trailing array isn't part of `size_of`; payload bytes get appended
+/// after this struct in the serialized stream.
+#[repr(C)]
+struct VendorDefinedEventData {
+    size: u32,
+    ty: u32,
+    timestamp: u64,
+    options: u32,
+    usage_page: u16,
+    usage: u16,
+    version: u32,
+    length: u32,
+}
+
+/// Mirrors `_IOHIDSystemQueueElement`. Trailing flexible
+/// `events[]` is not part of `size_of`; child events get appended
+/// after this struct.
+#[repr(C)]
+struct SystemQueueElement {
+    timestamp: u64,
+    device_id: u64,
+    options: u32,
+    event_count: u32,
+}
+
+/// Per-subtype payload value for the synthesized gesture event. Each
+/// variant maps to a specific CGEvent field id (0x71/0x72/0x73). The
+/// `None` case is for Began-/Ended-phase magnify and rotate events
+/// where the value is implicitly 0.
+enum GesturePayload {
+    Magnification(f32),
+    Rotation(f32),
+    SwipeDirection(u32),
+}
+
+/// Append a single CGEvent-serialized field entry: 2 bytes big-endian
+/// `count`, 1 byte `type` (0x40 = uint32), 1 byte `field` id, then
+/// `count` × 4 bytes of big-endian uint32 payload.
+fn append_field_u32(data: *mut c_void, field: u8, value: u32) {
+    let count: u16 = 1u16.to_be();
+    let type_byte: u8 = 0x40;
+    let value_be: u32 = value.to_be();
+    unsafe {
+        CFDataAppendBytes(data, &count as *const u16 as *const u8, 2);
+        CFDataAppendBytes(data, &type_byte, 1);
+        CFDataAppendBytes(data, &field, 1);
+        CFDataAppendBytes(data, &value_be as *const u32 as *const u8, 4);
+    }
+}
+
+/// As [`append_field_u32`] but with type 0xC0 (Float32 payload).
+fn append_field_f32(data: *mut c_void, field: u8, value: f32) {
+    let count: u16 = 1u16.to_be();
+    let type_byte: u8 = 0xC0;
+    let value_be: u32 = value.to_bits().to_be();
+    unsafe {
+        CFDataAppendBytes(data, &count as *const u16 as *const u8, 2);
+        CFDataAppendBytes(data, &type_byte, 1);
+        CFDataAppendBytes(data, &field, 1);
+        CFDataAppendBytes(data, &value_be as *const u32 as *const u8, 4);
+    }
+}
+
+/// Build a complete private gesture CGEvent ready to post. `subtype` is
+/// one of `GESTURE_SUBTYPE_*` (8 = magnify, 5 = rotate, 16 = swipe).
+/// `phase` is an `IOHIDEventPhaseBits` value (1=Began, 2=Changed,
+/// 4=Ended). `payload` carries the subtype-specific value.
+///
+/// Implements `tl_CGEventCreateFromGesture` from calftrail/Touch with
+/// no embedded child touches (Hammerspoon's `newGesture` does the same;
+/// the parent digitizer-hand collection alone is enough for AppKit's
+/// gesture-recognizer pipeline to bind to the event).
+fn synthesize_gesture_event(subtype: u32, phase: u32, payload: GesturePayload) -> Option<Event> {
+    let timestamp = unsafe { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) };
+
+    // 1. Base event: type=29 (NSEventTypeGesture) wrapper, magic 256
+    //    flags, IOHID-aligned timestamp.
+    let proto = unsafe { CGEventCreate(std::ptr::null_mut()) };
+    if proto.is_null() {
+        return None;
+    }
+    unsafe {
+        CGEventSetType(proto, kCGEventGesture);
+        CGEventSetFlags(proto, GESTURE_EVENT_FLAGS);
+        CGEventSetTimestamp(proto, timestamp);
+    }
+
+    // 2. Serialize. CGEvent's serialized form ends with a 24-byte empty
+    //    field-array placeholder we'll overwrite with our own payload.
+    let base_data = unsafe { CGEventCreateData(std::ptr::null(), proto) };
+    unsafe { CFRelease(proto as *const c_void) };
+    if base_data.is_null() {
+        return None;
+    }
+    let gesture_data = unsafe { CFDataCreateMutableCopy(std::ptr::null(), 0, base_data) };
+    unsafe { CFRelease(base_data as *const c_void) };
+    if gesture_data.is_null() {
+        return None;
+    }
+    let len = unsafe { CFDataGetLength(gesture_data) };
+    if len >= 24 {
+        unsafe {
+            CFDataDeleteBytes(
+                gesture_data,
+                CFRange {
+                    location: len - 24,
+                    length: 24,
+                },
+            )
+        };
+    }
+
+    // 3. Append the IOHID payload header: a 16-bit big-endian total size
+    //    plus the {0x10, 0x6D} marker that flags the rest as the
+    //    serialized-events blob.
+    let parent_size = std::mem::size_of::<DigitizerEventData>() as u32;
+    let queue_size = std::mem::size_of::<SystemQueueElement>() as u32;
+    let vendor_struct_size = std::mem::size_of::<VendorDefinedEventData>() as u32;
+    let vendor_payload_size: u32 = 40;
+    let vendor_total = vendor_struct_size + vendor_payload_size;
+    let total_size: u16 = (queue_size + vendor_total + parent_size) as u16;
+    unsafe {
+        let total_be = total_size.to_be();
+        CFDataAppendBytes(gesture_data, &total_be as *const u16 as *const u8, 2);
+        let marker: [u8; 2] = [0x10, 0x6D];
+        CFDataAppendBytes(gesture_data, marker.as_ptr(), 2);
+    }
+
+    // 4. Queue-element header (host-endian — these are raw IOHID
+    //    structs, not CGEvent-serialized fields).
+    let queue = SystemQueueElement {
+        timestamp,
+        device_id: 0,
+        options: kIOHIDEventOptionIsCollection,
+        event_count: 2, // parent digitizer + vendor token
+    };
+    unsafe {
+        CFDataAppendBytes(
+            gesture_data,
+            &queue as *const _ as *const u8,
+            queue_size as i64,
+        )
+    };
+
+    // 5. Parent digitizer event — a "hand" collection with empty quality
+    //    orientation. No real touches embedded; AppKit treats this as
+    //    "synthetic 2F gesture from a multitouch device" via the hand
+    //    transducer type and binds the recognizer accordingly.
+    let parent = DigitizerEventData {
+        size: parent_size,
+        ty: kIOHIDEventTypeDigitizer,
+        timestamp,
+        options: kIOHIDEventOptionIsCollection,
+        position_x: 0,
+        position_y: 0,
+        position_z: 0,
+        transducer_index: 0,
+        transducer_type: kIOHIDDigitizerTransducerTypeHand,
+        identity: 0,
+        event_mask: 0,
+        child_event_mask: 0,
+        button_mask: 0,
+        tip_pressure: 0,
+        barrel_pressure: 0,
+        twist: 0,
+        orientation_type: kIOHIDDigitizerOrientationTypeQuality,
+        orientation_quality: 0,
+        orientation_density: 0,
+        orientation_irregularity: 0,
+        orientation_major_radius: 0,
+        orientation_minor_radius: 0,
+    };
+    unsafe {
+        CFDataAppendBytes(
+            gesture_data,
+            &parent as *const _ as *const u8,
+            parent_size as i64,
+        )
+    };
+
+    // 6. Vendor token. usagePage 0xFF00 / usage 0x1777 is the magic
+    //    pair calftrail discovered AppleMultitouchHIDService stamps on
+    //    real-trackpad gesture events; the 40-byte payload is mostly
+    //    zeros but the first 8 bytes hold a deviceID (0 here = "no
+    //    specific device").
+    let vendor_header = VendorDefinedEventData {
+        size: vendor_total,
+        ty: kIOHIDEventTypeVendorDefined,
+        timestamp,
+        options: 0,
+        usage_page: 0xFF00,
+        usage: 0x1777,
+        version: 1,
+        length: vendor_payload_size,
+    };
+    unsafe {
+        CFDataAppendBytes(
+            gesture_data,
+            &vendor_header as *const _ as *const u8,
+            vendor_struct_size as i64,
+        );
+        let payload = [0u8; 40];
+        CFDataAppendBytes(gesture_data, payload.as_ptr(), vendor_payload_size as i64);
+    }
+
+    // 7. CGEvent fields (each 8-byte big-endian header + payload). The
+    //    0x6F/0x70/0x85 zero fields aren't optional — the AppKit field
+    //    walker expects them in this exact order. 0x8B/0x8C are
+    //    likewise required-zero floats at the tail.
+    append_field_u32(gesture_data, 0x6E, subtype); // gestureSubtype
+    append_field_u32(gesture_data, 0x6F, 0);
+    append_field_u32(gesture_data, 0x70, 0);
+    append_field_u32(gesture_data, 0x84, phase); // gesturePhase
+    append_field_u32(gesture_data, 0x85, 0);
+    match payload {
+        GesturePayload::Magnification(m) => append_field_f32(gesture_data, 0x71, m),
+        GesturePayload::Rotation(r) => append_field_f32(gesture_data, 0x72, r),
+        GesturePayload::SwipeDirection(d) => append_field_u32(gesture_data, 0x73, d),
+    }
+    append_field_f32(gesture_data, 0x8B, 0.0);
+    append_field_f32(gesture_data, 0x8C, 0.0);
+
+    // 8. Reconstitute the CGEvent.
+    let synth = unsafe { CGEventCreateFromData(std::ptr::null(), gesture_data) };
+    unsafe { CFRelease(gesture_data as *const c_void) };
+    Event::from_raw(synth)
 }
 
 // ---------- Public API ----------
@@ -323,17 +645,6 @@ pub enum Phase {
     Changed,
     Ended,
     Cancelled,
-}
-
-impl Phase {
-    fn mask(self) -> i64 {
-        match self {
-            Phase::Began => PHASE_BEGAN,
-            Phase::Changed => PHASE_CHANGED,
-            Phase::Ended => PHASE_ENDED,
-            Phase::Cancelled => PHASE_CANCELLED,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -645,18 +956,13 @@ impl Emitter {
             log::trace!("post: pinch suppressed (private_gestures=false)");
             return;
         }
-        if matches!(phase, Phase::Began) {
-            self.gesture_bracket(true);
-        }
-        if let Some(e) = Event::new() {
-            e.set_type(kCGEventGestureMagnify);
-            e.set_int(FIELD_GESTURE_PHASE, phase.mask());
-            e.set_dbl(FIELD_GESTURE_VALUE, delta);
+        if let Some(e) = synthesize_gesture_event(
+            GESTURE_SUBTYPE_MAGNIFY,
+            iohid_gesture_phase(phase),
+            GesturePayload::Magnification(delta as f32),
+        ) {
             log::trace!("post: pinch {:?} delta={:+.4}", phase, delta);
-            e.post();
-        }
-        if matches!(phase, Phase::Ended | Phase::Cancelled) {
-            self.gesture_bracket(false);
+            e.post_to(kCGSessionEventTap);
         }
     }
 
@@ -668,23 +974,20 @@ impl Emitter {
             log::trace!("post: rotate suppressed (private_gestures=false)");
             return;
         }
-        if matches!(phase, Phase::Began) {
-            self.gesture_bracket(true);
-        }
-        if let Some(e) = Event::new() {
-            e.set_type(kCGEventGestureRotate);
-            e.set_int(FIELD_GESTURE_PHASE, phase.mask());
-            e.set_dbl(FIELD_GESTURE_VALUE, delta_degrees);
+        if let Some(e) = synthesize_gesture_event(
+            GESTURE_SUBTYPE_ROTATE,
+            iohid_gesture_phase(phase),
+            GesturePayload::Rotation(delta_degrees as f32),
+        ) {
             log::trace!("post: rotate {:?} delta={:+.2}deg", phase, delta_degrees);
-            e.post();
-        }
-        if matches!(phase, Phase::Ended | Phase::Cancelled) {
-            self.gesture_bracket(false);
+            e.post_to(kCGSessionEventTap);
         }
     }
 
     /// Emit a 3-finger swipe in `direction`. macOS treats 3F swipe as a
-    /// discrete navigation event (Safari back/forward, etc.).
+    /// discrete navigation event (Safari back/forward, etc.). The
+    /// IOHID `IOHIDSwipeMask` enum encodes direction as a bitfield:
+    /// up=1, down=2, left=4, right=8.
     pub fn swipe(&self, direction: SwipeDirection) {
         if !self.cfg.private_gestures {
             log::debug!(
@@ -693,25 +996,20 @@ impl Emitter {
             );
             return;
         }
-        log::debug!("post: swipe {:?}", direction);
-        let (dx, dy): (f64, f64) = match direction {
-            SwipeDirection::Left => (-1.0, 0.0),
-            SwipeDirection::Right => (1.0, 0.0),
-            SwipeDirection::Up => (0.0, 1.0),
-            SwipeDirection::Down => (0.0, -1.0),
+        let mask: u32 = match direction {
+            SwipeDirection::Up => 1,
+            SwipeDirection::Down => 2,
+            SwipeDirection::Left => 4,
+            SwipeDirection::Right => 8,
         };
-        // BeginGesture
-        self.gesture_bracket(true);
-        // The swipe event itself: type=31, X delta in value, Y delta in
-        // swipe-mask field. (This matches the NSEvent.deltaX/deltaY split
-        // for swipe events.)
-        if let Some(e) = Event::new() {
-            e.set_type(kCGEventGestureSwipe);
-            e.set_dbl(FIELD_GESTURE_VALUE, dx);
-            e.set_dbl(FIELD_GESTURE_SWIPE_MASK as u32, dy);
-            e.post();
+        if let Some(e) = synthesize_gesture_event(
+            GESTURE_SUBTYPE_SWIPE,
+            0,
+            GesturePayload::SwipeDirection(mask),
+        ) {
+            log::debug!("post: swipe {:?}", direction);
+            e.post_to(kCGSessionEventTap);
         }
-        self.gesture_bracket(false);
     }
 }
 
@@ -934,20 +1232,6 @@ impl Drop for Emitter {
         self.momentum.cancel();
         if !self.event_source.is_null() {
             unsafe { CFRelease(self.event_source as *const c_void) };
-        }
-    }
-}
-
-impl Emitter {
-    fn gesture_bracket(&self, begin: bool) {
-        if let Some(e) = Event::new() {
-            e.set_type(if begin {
-                kCGEventGestureBegin
-            } else {
-                kCGEventGestureEnd
-            });
-            e.set_int(FIELD_GESTURE_SUBTYPE, 0);
-            e.post();
         }
     }
 }
