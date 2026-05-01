@@ -16,7 +16,7 @@ use core_foundation::base::{CFType, TCFType};
 use core_foundation::data::CFData;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
-use core_foundation::runloop::{CFRunLoop, CFRunLoopRun, kCFRunLoopDefaultMode};
+use core_foundation::runloop::{CFRunLoop, CFRunLoopRun, CFRunLoopStop, kCFRunLoopDefaultMode};
 use core_foundation::string::CFString;
 use std::ffi::c_void;
 use std::os::raw::c_int;
@@ -32,6 +32,16 @@ type IOHIDReportType = u32;
 
 const kIOHIDOptionsTypeNone: IOOptionBits = 0;
 const kIOReturnSuccess: IOReturn = 0;
+const kIOHIDReportTypeFeature: IOHIDReportType = 2;
+
+/// Microsoft Precision Touchpad "Input Mode" feature report ID (declared
+/// in the firmware's PTP descriptor at `rmk/src/hid.rs:PTP_REPORT_DESC`).
+/// Writing `[0x03]` here flips the firmware's `TRACKPAD_USE_PTP` atomic
+/// — without this, the firmware never knows to switch from its mouse
+/// path to publishing PTP reports.
+const PTP_INPUT_MODE_REPORT_ID: isize = 0x08;
+const PTP_INPUT_MODE_MULTITOUCH: u8 = 0x03;
+const PTP_INPUT_MODE_MOUSE: u8 = 0x00;
 
 const KEY_VENDOR_ID: &str = "VendorID";
 const KEY_PRODUCT_ID: &str = "ProductID";
@@ -90,6 +100,16 @@ unsafe extern "C" {
         callback: IOHIDReportCallback,
         context: *mut c_void,
     );
+    /// `IOReturn IOHIDDeviceSetReport(IOHIDDeviceRef, IOHIDReportType,
+    /// CFIndex reportID, const uint8_t *report, CFIndex reportLength)`.
+    /// CFIndex is `long` → `isize` on 64-bit macOS.
+    fn IOHIDDeviceSetReport(
+        device: IOHIDDeviceRef,
+        report_type: IOHIDReportType,
+        report_id: isize,
+        report: *const u8,
+        report_length: isize,
+    ) -> IOReturn;
 }
 
 // ---- Public API ----
@@ -119,6 +139,17 @@ struct DeviceState {
     layout: Layout,
     buf: Vec<u8>,
     bridge: *mut Bridge,
+}
+
+impl Drop for DeviceState {
+    fn drop(&mut self) {
+        // Revert the firmware to mouse mode. Fires both on USB removal
+        // (after the device is gone — the SET will fail, that's fine)
+        // and on graceful companion shutdown when `Manager` drops the
+        // bridge (device still attached, the SET takes effect and the
+        // user's trackpad keeps working as a plain mouse).
+        set_ptp_input_mode(self.device, PTP_INPUT_MODE_MOUSE);
+    }
 }
 
 impl Manager {
@@ -187,14 +218,76 @@ impl Manager {
             self.filter.pid
         );
 
+        // Without an explicit teardown path the kernel SIGTERMs us straight
+        // to exit and `DeviceState::drop` (which reverts the firmware to
+        // mouse mode) never runs — the trackpad would stay stuck in PTP
+        // mode after the companion exits. Stop the run loop on signal so
+        // `CFRunLoopRun` returns and Rust unwinding drops the bridge
+        // normally.
+        install_signal_shutdown();
+
         unsafe { CFRunLoopRun() };
 
         Ok(())
     }
 }
 
+/// Block SIGINT/SIGTERM in the main thread and spawn a sigwait worker
+/// that stops the main run loop when either arrives. `sigwait` on a
+/// dedicated thread is the supported way to handle signals from a
+/// CFRunLoop process (raw signal handlers can't safely call CF APIs;
+/// most CF functions aren't async-signal-safe).
+///
+/// Must be called on the main thread (the one that will run
+/// `CFRunLoopRun`); the captured run loop is whichever
+/// `CFRunLoop::get_current()` returns at this call site.
+fn install_signal_shutdown() {
+    use std::mem;
+    use std::ptr;
+
+    // The CFRunLoopRef from get_current() is reference-counted by Apple
+    // but the main run loop has effectively static lifetime, so capturing
+    // its raw pointer as a `usize` for the worker thread is safe.
+    // Going through `usize` side-steps `!Send` on `CFRunLoop` itself.
+    let run_loop_ref = CFRunLoop::get_current().as_concrete_TypeRef() as usize;
+
+    unsafe {
+        let mut set: libc::sigset_t = mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        // Block in the main thread *before* spawning the worker so the
+        // worker inherits the block; otherwise a signal arriving between
+        // pthread_sigmask and the spawn would be delivered to the main
+        // thread (default-action: terminate) and we'd skip cleanup.
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, ptr::null_mut());
+    }
+
+    std::thread::spawn(move || {
+        unsafe {
+            let mut set: libc::sigset_t = mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGINT);
+            libc::sigaddset(&mut set, libc::SIGTERM);
+            let mut sig: libc::c_int = 0;
+            // sigwait removes the matching signal from the pending set
+            // and returns it; safe to call CF APIs once we're back in
+            // ordinary thread context (not a signal handler).
+            let _ = libc::sigwait(&set, &mut sig);
+            log::info!("received signal {sig}, shutting down");
+            CFRunLoopStop(run_loop_ref as *mut _);
+        }
+    });
+}
+
 impl Drop for Manager {
     fn drop(&mut self) {
+        // Drop the bridge first so each `DeviceState::drop` (writing
+        // Input Mode = 0 back to the firmware) fires while the
+        // IOHIDManager is still open. Closing the manager closes every
+        // opened device, after which `IOHIDDeviceSetReport` returns
+        // kIOReturnNotOpen and the cleanup write would be wasted.
+        self.bridge = None;
         unsafe {
             IOHIDManagerClose(self.raw, kIOHIDOptionsTypeNone);
         }
@@ -254,7 +347,44 @@ unsafe extern "C" fn on_device_matched(
         );
     }
 
+    // Tell the firmware to enter PTP mode. Without this the firmware's
+    // existing HID-mouse `TrackpadProcessor` keeps publishing on the
+    // standard mouse path and the PTP input reports we're about to read
+    // never get produced. The corresponding `TRACKPAD_USE_PTP` gate is
+    // in `rmk/src/hid.rs`.
+    set_ptp_input_mode(device, PTP_INPUT_MODE_MULTITOUCH);
+
     bridge.devices.push(state);
+}
+
+/// Send a 1-byte SET_FEATURE on the PTP Input Mode report. Best-effort:
+/// errors are logged but don't abort the matched-device flow — even if
+/// the SET fails the companion can still observe traffic, just nothing
+/// useful arrives until the firmware enters PTP mode by some other path.
+fn set_ptp_input_mode(device: IOHIDDeviceRef, mode: u8) {
+    let payload = [mode];
+    let rv = unsafe {
+        IOHIDDeviceSetReport(
+            device,
+            kIOHIDReportTypeFeature,
+            PTP_INPUT_MODE_REPORT_ID,
+            payload.as_ptr(),
+            payload.len() as isize,
+        )
+    };
+    if rv == kIOReturnSuccess {
+        log::info!("PTP input mode set to {:#04x}", mode);
+    } else {
+        // 0xE00002C7 = kIOReturnUnsupported; common when the matched
+        // interface lacks the InputMode feature (i.e. it's a real PTP
+        // device that uses a different report ID or layout). Our own
+        // firmware uses 0x08 by construction.
+        log::warn!(
+            "SET_FEATURE InputMode={:#04x} failed: {:#x}",
+            mode,
+            rv as u32
+        );
+    }
 }
 
 unsafe extern "C" fn on_device_removed(
