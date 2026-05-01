@@ -625,6 +625,9 @@ impl<O: Output> State<O> {
                         ddx, ddy, base.scroll_velocity.0, base.scroll_velocity.1,
                     );
                     self.out.scroll(ddx, ddy, Phase::Changed);
+                    // Advance baseline only on emit — sub-dead-zone drift
+                    // must accumulate, not get reset every frame.
+                    base.last_centroid = centroid;
                 }
             }
             GestureKind::TwoFingerPinch => {
@@ -646,7 +649,11 @@ impl<O: Output> State<O> {
             _ => {}
         }
 
-        base.last_centroid = centroid;
+        // Pan advances `last_centroid` on emit (above); other kinds don't
+        // read it but stay in sync.
+        if !matches!(self.kind, GestureKind::TwoFingerPan) {
+            base.last_centroid = centroid;
+        }
         base.last_angle = ang;
         self.two_baseline = Some(base);
     }
@@ -1234,6 +1241,60 @@ mod tests {
         assert!(
             log.iter().any(|l| l.contains("click Left")),
             "tap should still fire ({log:?})",
+        );
+    }
+
+    /// Captures the user-reported regression: while panning, slow steady
+    /// drift below `MOTION_DEAD_ZONE_MM` (0.04 mm) per frame must still
+    /// produce scroll events as cumulative motion crosses the threshold.
+    /// Pre-fix, `base.last_centroid` advanced every frame regardless of
+    /// whether scroll fired, so per-frame deltas at the chip's quantum
+    /// (~0.02 mm) were thrown away — a finger drifting at ~1 mm/s
+    /// emitted zero `Changed` events for seconds at a time.
+    #[test]
+    fn slow_pan_drift_below_dead_zone_still_emits() {
+        let r = Recorder::default();
+        let mut s = State::new(&r);
+        let t0 = Instant::now();
+        let frame_two_mm = |ay: f64, by: f64| Frame {
+            contacts: vec![
+                Contact { id: 1, x: 20.0, y: ay, tip: true, confidence: true },
+                Contact { id: 2, x: 30.0, y: by, tip: true, confidence: true },
+            ],
+            scan_time_100us: 0,
+            button: false,
+        };
+        // Two fingers down; hold past TAP_MAX_DURATION (150 ms) so the
+        // could-still-tap gate releases.
+        s.on_frame_at(frame_two_mm(25.0, 25.0), t0);
+        s.on_frame_at(frame_two_mm(25.0, 25.0), at(t0, 200));
+        // One decisive frame to lock TwoFingerPan (centroid moves
+        // 0.5 mm > PAN_LOCK_MM = 0.4 mm). Drain the resulting Began
+        // and large initial Changed.
+        s.on_frame_at(frame_two_mm(25.5, 25.5), at(t0, 216));
+        let _ = r.pop();
+        // Slow steady drift: 0.02 mm/frame at ~60 Hz ≈ 1.2 mm/s. Each
+        // per-frame Δy is half the dead zone, so a per-frame check
+        // never fires; cumulative motion crosses the dead zone every
+        // 3rd frame.
+        for i in 1..=10u64 {
+            let y = 25.5 + 0.02 * i as f64;
+            s.on_frame_at(frame_two_mm(y, y), at(t0, 216 + 16 * i));
+        }
+        let log = r.pop();
+        let changed_emits: Vec<&String> = log
+            .iter()
+            .filter(|l| l.starts_with("scroll ") && l.contains("Changed"))
+            .filter(|l| {
+                let parts: Vec<&str> = l.split_whitespace().collect();
+                let dy: f64 = parts[2].parse().unwrap();
+                dy.abs() > 0.0
+            })
+            .collect();
+        assert!(
+            !changed_emits.is_empty(),
+            "slow drift below per-frame dead zone must still emit scroll \
+             events as cumulative motion (~0.2 mm here) crosses it ({log:?})",
         );
     }
 
