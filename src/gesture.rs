@@ -20,16 +20,12 @@ use std::time::{Duration, Instant};
 // finger ergonomics, not pad fractions.
 
 /// Max distance a contact may drift from its landing point during a
-/// short touch and still count as a tap. Matches rmk's `TAP_DIST = 40`
-/// chip units (≈ 0.66 mm on its 65 mm pad). Going looser added a
-/// noticeable latency to scroll onset — every chip frame whose
-/// per-contact drift hadn't yet crossed this threshold delayed the
-/// `TwoFingerUnclassified → TwoFingerPan` lock — so we match rmk
-/// even though it's slightly less tap-forgiving than macOS conventions.
-const TAP_MAX_MOVE_MM: f64 = 0.66;
-/// Max touch duration to count as a tap. Matches rmk's `TAP_TIME` for
-/// the same reason as `TAP_MAX_MOVE_MM`: a longer window pushes scroll
-/// onset out by the same amount on slow / barely-moving touches.
+/// short touch and still count as a tap. ~1 mm covers normal finger
+/// jitter without admitting deliberate cursor moves.
+const TAP_MAX_MOVE_MM: f64 = 1.0;
+/// Max touch duration to count as a tap. Matches rmk's `TAP_TIME`,
+/// tightened from 220 ms to keep slow / barely-moving touches from
+/// delaying scroll onset.
 const TAP_MAX_DURATION: Duration = Duration::from_millis(150);
 /// Centroid motion below this between frames is treated as jitter.
 const MOTION_DEAD_ZONE_MM: f64 = 0.04;
