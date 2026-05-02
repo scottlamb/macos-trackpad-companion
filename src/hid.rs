@@ -452,18 +452,30 @@ unsafe extern "C" fn on_input_report(
         // `n=0` reports carry the lift transition (tip_switch=0 on the
         // last touching contact), and the silence-on-empty version of
         // this log made finger-up indistinguishable from the chip going
-        // idle.
-        match frame.contacts.first() {
-            Some(c) => log::debug!(
-                "frame n={} c0 id={} at=({:>5.2},{:>5.2})mm tip={} button={}",
+        // idle. All contacts are printed (not just the first) so 2F
+        // gesture diagnosis doesn't have to back the second finger out
+        // of centroid deltas.
+        if frame.contacts.is_empty() {
+            log::debug!("frame n=0 button={}", frame.button);
+        } else {
+            use std::fmt::Write;
+            let mut s = String::with_capacity(32 * frame.contacts.len());
+            for (i, c) in frame.contacts.iter().enumerate() {
+                if i > 0 {
+                    s.push(' ');
+                }
+                let _ = write!(
+                    s,
+                    "c{i} id={} at=({:>5.2},{:>5.2})mm tip={}",
+                    c.id, c.x, c.y, c.tip,
+                );
+            }
+            log::debug!(
+                "frame n={} {} button={}",
                 frame.contacts.len(),
-                c.id,
-                c.x,
-                c.y,
-                c.tip,
+                s,
                 frame.button,
-            ),
-            None => log::debug!("frame n=0 button={}", frame.button),
+            );
         }
     }
     (bridge.on_frame)(frame);

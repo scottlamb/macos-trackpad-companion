@@ -38,8 +38,13 @@ const MOTION_DEAD_ZONE_MM: f64 = 0.04;
 const PAN_LOCK_MM: f64 = 0.4;
 /// Distance-change ratio needed to lock 2F mode = pinch (unitless).
 const PINCH_LOCK_RATIO: f64 = 0.04;
-/// Angle change (radians) needed to lock 2F mode = rotate.
-const ROTATE_LOCK_RAD: f64 = 6.0_f64 * std::f64::consts::PI / 180.0;
+/// Angle change (radians) past which the 2F lock check considers
+/// rotation present. Pinch and rotate fire as concurrent streams once
+/// locked, so this no longer races against pinch — but it still
+/// determines how soon the locked-2F mode fires on a primarily-rotate
+/// gesture (a 3° rotate would otherwise wait for pinch to cross before
+/// the lock triggered). 4° matches Apple's PTP engine.
+const ROTATE_LOCK_RAD: f64 = 4.0_f64 * std::f64::consts::PI / 180.0;
 
 /// Centroid travel needed to lock the swipe axis (horizontal vs
 /// vertical). Below this, the gesture is still ambiguous; we wait
@@ -77,13 +82,37 @@ enum GestureKind {
     OneFinger,
     TwoFingerUnclassified,
     TwoFingerPan,
-    TwoFingerPinch,
-    TwoFingerRotate,
+    /// Locked 2F gesture that emits pinch and rotate events concurrently.
+    /// On macOS PTP, pan/scroll is the only mutually-exclusive sibling
+    /// of this mode — within the locked 2F, pinch and rotate fire as
+    /// independent event streams, so a gesture that's mostly rotation
+    /// but spreads slightly produces both rotate Changed and pinch
+    /// Changed deltas. Modeling them as a single locked kind avoids
+    /// the score-race tiebreak failures we'd otherwise get on
+    /// anti-parallel diagonal motion.
+    TwoFingerPinchAndRotate,
     ThreeFingerLive,
     FourFingerLive,
     /// Latched after a swipe fires, until all fingers lift.
     SwipeLatched,
 }
+
+/// Within the locked TwoFingerPinchAndRotate mode, which stream is
+/// currently emitting Changed events. Sticky: switches only when the
+/// other stream's normalized signal dominates the current one by 1.5×.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PinchRotateDominant {
+    Pinch,
+    Rotate,
+}
+
+/// Other-stream-must-beat-current-by ratio for switching the dominant
+/// stream within the locked 2F mode. 1.5 means rotate has to look 50%
+/// stronger than pinch (or vice versa) before we flip — enough to ignore
+/// frame-to-frame noise on signals of comparable magnitude, low enough
+/// that a deliberate transition between zoom and twist still flips
+/// within 1-2 frames.
+const PINCH_ROTATE_HYSTERESIS: f64 = 1.5;
 
 #[derive(Clone, Copy, Debug)]
 struct TwoFingerBaseline {
@@ -100,8 +129,18 @@ struct TwoFingerBaseline {
     initial_a: (u8, (f64, f64)),
     initial_b: (u8, (f64, f64)),
     last_centroid: (f64, f64),
-    last_scale_emitted: f64,
-    last_angle: f64,
+    /// Previous-frame scale and angle, refreshed every frame so per-frame
+    /// pinch and rotate deltas are always one-frame. Cross-stream
+    /// accumulation (when one stream is suppressed) felt jerky — the
+    /// suppressed stream's motion is intentionally dropped instead.
+    prev_scale: f64,
+    prev_angle: f64,
+    /// Sticky pinch-vs-rotate selection within the locked 2F mode.
+    /// At any instant the locked mode emits one stream's Changed event,
+    /// and we only switch when the other stream's normalized signal
+    /// dominates by 1.5×. Set when the lock fires, based on which
+    /// score crossed harder.
+    pinch_rotate_dominant: PinchRotateDominant,
     /// EMA-smoothed centroid velocity in mm/sec, sampled while in
     /// `TwoFingerPan`. Seeds inertia at lift via `Output::scroll_inertia`
     /// — modeled on rmk's `TrackpadProcessor` velocity track.
@@ -297,8 +336,7 @@ impl<O: Output> State<O> {
             1 => GestureKind::OneFinger,
             2 => match self.kind {
                 GestureKind::TwoFingerPan
-                | GestureKind::TwoFingerPinch
-                | GestureKind::TwoFingerRotate
+                | GestureKind::TwoFingerPinchAndRotate
                 | GestureKind::TwoFingerUnclassified => self.kind,
                 _ => GestureKind::TwoFingerUnclassified,
             },
@@ -439,15 +477,9 @@ impl<O: Output> State<O> {
                     self.suppress_one_finger_click = true;
                 }
             }
-            GestureKind::TwoFingerPinch => {
-                log::debug!("pinch: ended");
+            GestureKind::TwoFingerPinchAndRotate => {
+                log::debug!("pinch+rotate: ended");
                 self.out.pinch(0.0, Phase::Ended);
-                if matches!(new_kind, GestureKind::OneFinger) {
-                    self.suppress_one_finger_click = true;
-                }
-            }
-            GestureKind::TwoFingerRotate => {
-                log::debug!("rotate: ended");
                 self.out.rotate(0.0, Phase::Ended);
                 if matches!(new_kind, GestureKind::OneFinger) {
                     self.suppress_one_finger_click = true;
@@ -579,8 +611,11 @@ impl<O: Output> State<O> {
                     initial_a: (a.id, (a.x, a.y)),
                     initial_b: (b.id, (b.x, b.y)),
                     last_centroid: centroid,
-                    last_scale_emitted: 1.0,
-                    last_angle: ang,
+                    prev_scale: 1.0,
+                    prev_angle: ang,
+                    // Default; overwritten at lock based on which signal
+                    // crossed harder.
+                    pinch_rotate_dominant: PinchRotateDominant::Pinch,
                     scroll_velocity: (0.0, 0.0),
                     last_scroll_time: None,
                 });
@@ -607,8 +642,7 @@ impl<O: Output> State<O> {
             GestureKind::OneFinger => self.dispatch_one(active, now),
             GestureKind::TwoFingerUnclassified
             | GestureKind::TwoFingerPan
-            | GestureKind::TwoFingerPinch
-            | GestureKind::TwoFingerRotate => self.dispatch_two(active, now),
+            | GestureKind::TwoFingerPinchAndRotate => self.dispatch_two(active, now),
             GestureKind::ThreeFingerLive | GestureKind::FourFingerLive => self.dispatch_swipe(active, now),
         }
     }
@@ -686,7 +720,11 @@ impl<O: Output> State<O> {
             let could_still_tap = max_move < TAP_MAX_MOVE_MM && dur < TAP_MAX_DURATION;
             if could_still_tap {
                 base.last_centroid = centroid;
-                base.last_angle = ang;
+                // Track scale and angle pre-lock so the first Changed
+                // emit after lock is a one-frame delta, not a cumulative
+                // pre-lock chunk.
+                base.prev_scale = dist / base.initial_distance;
+                base.prev_angle = ang;
                 self.two_baseline = Some(base);
                 return;
             }
@@ -718,7 +756,30 @@ impl<O: Output> State<O> {
             let common_mag = (common.0.powi(2) + common.1.powi(2)).sqrt();
             let differential_mag =
                 (differential.0.powi(2) + differential.1.powi(2)).sqrt();
-            let pan_qualified = common_mag > differential_mag;
+            // Pan requires both fingers to participate roughly equally
+            // and in roughly the same direction. The strict
+            // `common > differential` test alone passes some non-pan
+            // gestures: an anchored-finger rotate where the pinned
+            // finger drifts a few hundredths of a mm in the same
+            // direction as the moving one tips the test true; an
+            // asymmetric gesture with c0 moving 1.5 mm and c1 moving
+            // 0.2 mm (the user's anchored-finger rotates that locked
+            // as scroll, /tmp/rotate.txt:315/414/760) does the same.
+            // Two extra gates close those holes:
+            //
+            // 1. Balance: the slower contact must move at least 30% of
+            //    the faster. Below that the gesture is dominated by
+            //    one finger — pinch/rotate territory, not pan.
+            // 2. Margin: |common| must beat |differential| by 20%, not
+            //    just by epsilon. Near-perpendicular motion where the
+            //    common-vs-differential test is right on the boundary
+            //    isn't really "translation."
+            let da_mag = (da.0.powi(2) + da.1.powi(2)).sqrt();
+            let db_mag = (db.0.powi(2) + db.1.powi(2)).sqrt();
+            let min_per_finger = da_mag.min(db_mag);
+            let max_per_finger = da_mag.max(db_mag);
+            let pan_qualified = common_mag > differential_mag * 1.2
+                && min_per_finger >= max_per_finger * 0.3;
 
             let pan = if pan_qualified {
                 common_mag / PAN_LOCK_MM
@@ -728,13 +789,16 @@ impl<O: Output> State<O> {
             let pinch = (dist / base.initial_distance - 1.0).abs() / PINCH_LOCK_RATIO;
             let rot = angle_delta(ang, base.initial_angle).abs() / ROTATE_LOCK_RAD;
             if pan >= 1.0 || pinch >= 1.0 || rot >= 1.0 {
-                let max = pan.max(pinch).max(rot);
-                let new_kind = if max == pan {
+                // Pan is mutually exclusive with pinch/rotate (matches
+                // macOS PTP behavior: a 2F gesture locks into either
+                // pan/scroll or the pinch+rotate pair). It only wins
+                // if it's the strongest signal — a gesture that's
+                // mostly pinch but drifts the centroid a bit shouldn't
+                // be misclassified as pan.
+                let new_kind = if pan >= 1.0 && pan >= pinch && pan >= rot {
                     GestureKind::TwoFingerPan
-                } else if max == pinch {
-                    GestureKind::TwoFingerPinch
                 } else {
-                    GestureKind::TwoFingerRotate
+                    GestureKind::TwoFingerPinchAndRotate
                 };
                 self.kind = new_kind;
                 match new_kind {
@@ -742,13 +806,26 @@ impl<O: Output> State<O> {
                         log::debug!("scroll: began (pan_score={:.2})", pan);
                         self.out.scroll(0.0, 0.0, Phase::Began);
                     }
-                    GestureKind::TwoFingerPinch => {
-                        log::debug!("pinch: began (pinch_score={:.2})", pinch);
+                    GestureKind::TwoFingerPinchAndRotate => {
+                        log::debug!(
+                            "pinch+rotate: began (pinch_score={:.2}, rot_score={:.2})",
+                            pinch, rot,
+                        );
+                        // Both streams begin at lock so a downstream app
+                        // subscribed to either gets a coherent
+                        // Began/Changed/Ended sequence — Changed events
+                        // alternate per-frame based on which stream is
+                        // dominant.
                         self.out.pinch(0.0, Phase::Began);
-                    }
-                    GestureKind::TwoFingerRotate => {
-                        log::debug!("rotate: began (rot_score={:.2})", rot);
                         self.out.rotate(0.0, Phase::Began);
+                        // Seed the dominant stream from whichever signal
+                        // crossed harder at lock. Subsequent switching
+                        // is gated by `PINCH_ROTATE_HYSTERESIS`.
+                        base.pinch_rotate_dominant = if rot > pinch {
+                            PinchRotateDominant::Rotate
+                        } else {
+                            PinchRotateDominant::Pinch
+                        };
                     }
                     _ => {}
                 }
@@ -783,31 +860,58 @@ impl<O: Output> State<O> {
                     base.last_centroid = centroid;
                 }
             }
-            GestureKind::TwoFingerPinch => {
+            GestureKind::TwoFingerPinchAndRotate => {
+                // Per-frame, the locked 2F mode emits *one* of pinch
+                // or rotate — whichever the sticky `pinch_rotate_dominant`
+                // says, switched only when the other stream's normalized
+                // signal beats it by `PINCH_ROTATE_HYSTERESIS`. Deltas
+                // are one-frame (relative to prev_scale / prev_angle,
+                // both refreshed every frame) so motion the suppressed
+                // stream missed is dropped rather than catching up as a
+                // jerk later. Matches macOS PTP, which switches between
+                // zoom and rotate within a single locked 2F gesture
+                // without ever doubling them up on the same frame.
                 let scale = dist / base.initial_distance;
-                let delta = scale - base.last_scale_emitted;
-                if delta.abs() > 1e-4 {
-                    log::debug!("pinch: delta={:+.4} scale={:.4}", delta, scale);
-                    self.out.pinch(delta, Phase::Changed);
-                    base.last_scale_emitted = scale;
+                let scale_delta = scale - base.prev_scale;
+                let angle_d = angle_delta(ang, base.prev_angle);
+                let pinch_strength = scale_delta.abs() / PINCH_LOCK_RATIO;
+                let rot_strength = angle_d.abs() / ROTATE_LOCK_RAD;
+                base.pinch_rotate_dominant = match base.pinch_rotate_dominant {
+                    PinchRotateDominant::Pinch
+                        if rot_strength > pinch_strength * PINCH_ROTATE_HYSTERESIS =>
+                    {
+                        PinchRotateDominant::Rotate
+                    }
+                    PinchRotateDominant::Rotate
+                        if pinch_strength > rot_strength * PINCH_ROTATE_HYSTERESIS =>
+                    {
+                        PinchRotateDominant::Pinch
+                    }
+                    other => other,
+                };
+                match base.pinch_rotate_dominant {
+                    PinchRotateDominant::Pinch if scale_delta.abs() > 1e-4 => {
+                        log::debug!("pinch: delta={:+.4} scale={:.4}", scale_delta, scale);
+                        self.out.pinch(scale_delta, Phase::Changed);
+                    }
+                    PinchRotateDominant::Rotate if angle_d.abs() > 1e-4 => {
+                        log::debug!("rotate: delta={:+.2}deg", angle_d.to_degrees());
+                        self.out.rotate(angle_d.to_degrees(), Phase::Changed);
+                    }
+                    _ => {}
                 }
-            }
-            GestureKind::TwoFingerRotate => {
-                let delta = angle_delta(ang, base.last_angle);
-                if delta.abs() > 1e-4 {
-                    log::debug!("rotate: delta={:+.2}deg", delta.to_degrees());
-                    self.out.rotate(delta.to_degrees(), Phase::Changed);
-                }
+                base.prev_scale = scale;
+                base.prev_angle = ang;
             }
             _ => {}
         }
 
         // Pan advances `last_centroid` on emit (above); other kinds don't
-        // read it but stay in sync.
+        // read it but stay in sync. The PinchAndRotate dispatch already
+        // refreshes `prev_scale` / `prev_angle` every frame.
         if !matches!(self.kind, GestureKind::TwoFingerPan) {
             base.last_centroid = centroid;
         }
-        base.last_angle = ang;
         self.two_baseline = Some(base);
     }
 
@@ -1181,6 +1285,195 @@ mod tests {
         assert!(
             log.iter().any(|l| l.starts_with("rotate") && l.contains("Began")),
             "{log:?}"
+        );
+    }
+
+    /// Once locked into pinch-dominant mode, small rotational noise
+    /// must not flip the dominant stream every frame — the user found
+    /// per-frame switching disorienting. The `PINCH_ROTATE_HYSTERESIS`
+    /// gate keeps the locked stream sticky until the other genuinely
+    /// dominates by 1.5×. This synthesizes a clean pinch (0.6% scale
+    /// shrink per frame, well above pinch's lock dead zone) with tiny
+    /// rotational drift that keeps rotate's per-frame strength small
+    /// but non-zero — pinch must stay dominant, no spurious rotate
+    /// Changed events.
+    #[test]
+    fn pinch_dominant_stream_stays_sticky_under_rotational_noise() {
+        let r = Recorder::default();
+        let mut s = State::new(&r);
+        // c0 and c1 anti-parallel along x; c1 drifts +y by 0.04mm per
+        // frame so a tiny angle change accumulates without dominating.
+        s.on_frame(frame(&[(1, 0.20, 0.50), (2, 0.80, 0.50)]));
+        s.on_frame(frame(&[(1, 0.205, 0.5004), (2, 0.795, 0.5008)]));
+        s.on_frame(frame(&[(1, 0.215, 0.5008), (2, 0.785, 0.5016)]));
+        s.on_frame(frame(&[(1, 0.230, 0.5012), (2, 0.770, 0.5024)]));
+        s.on_frame(frame(&[(1, 0.245, 0.5016), (2, 0.755, 0.5032)]));
+        s.on_frame(frame(&[(1, 0.260, 0.5020), (2, 0.740, 0.5040)]));
+        s.on_frame(frame(&[(1, 0.275, 0.5024), (2, 0.725, 0.5048)]));
+        s.on_frame(frame(&[(1, 0.290, 0.5028), (2, 0.710, 0.5056)]));
+        s.on_frame(frame(&[]));
+        let log = r.pop();
+        assert!(
+            log.iter().any(|l| l.starts_with("pinch") && l.contains("Changed")),
+            "expected pinch Changed (the gesture is mostly pinch), got: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("rotate") && l.contains("Changed")),
+            "rotational noise must not flip dominance — no rotate Changed expected, got: {log:?}"
+        );
+    }
+
+    /// Asymmetric two-finger motion where one contact moves much more
+    /// than the other but both move in roughly the same direction —
+    /// pan_qualified would slip past the strict `common > differential`
+    /// test by a hair (~7%) and the small finger's motion (~0.2 mm)
+    /// scraped past the old min-per-finger floor. Reproduces
+    /// /tmp/rotate.txt:411-413 (one of the unintended scroll locks
+    /// during the user's pinch/rotate alternation session). The
+    /// balance-ratio gate (slower contact ≥ 30% of faster) is what
+    /// closes this hole.
+    #[test]
+    fn asymmetric_directionally_correlated_motion_does_not_lock_pan() {
+        let r = Recorder::default();
+        let mut s = State::new(&r);
+        // c0 barely moves while c1 sweeps 0.8 mm in similar direction.
+        s.on_frame(frame(&[(1, 0.2172, 0.5416), (2, 0.6196, 0.5206)]));
+        s.on_frame(frame(&[(1, 0.2196, 0.5412), (2, 0.6240, 0.5162)]));
+        s.on_frame(frame(&[(1, 0.2210, 0.5404), (2, 0.6306, 0.5090)]));
+        s.on_frame(frame(&[(1, 0.2216, 0.5400), (2, 0.6360, 0.5032)]));
+        s.on_frame(frame(&[(1, 0.2220, 0.5396), (2, 0.6426, 0.4976)]));
+        s.on_frame(frame(&[]));
+        let log = r.pop();
+        assert!(
+            !log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            "asymmetric motion must not classify as pan: {log:?}"
+        );
+    }
+
+    /// Mixed pinch+rotate gesture: pinch dominates the lock frame, but
+    /// rotation dominates subsequent frames — both streams must surface
+    /// in their dominant frames. Per-frame the locked 2F mode switches
+    /// between pinch and rotate based on which signal is stronger
+    /// (normalized by lock thresholds), matching macOS PTP. Reproduces
+    /// /tmp/rotate.txt:152-180 — pinch_score=1.52 at lock with a -6%
+    /// scale delta, then rot deltas of -3.5°, -3.2°, -2.4° per frame
+    /// while pinch deltas drop to -0.01 (rot crosses the dominance
+    /// threshold by the next frame).
+    #[test]
+    fn mixed_pinch_rotate_emits_both_streams_in_their_dominant_frames() {
+        let r = Recorder::default();
+        let mut s = State::new(&r);
+        // Coordinates lifted from /tmp/rotate.txt:152-174.
+        s.on_frame(frame(&[(1, 0.9378, 0.6374), (2, 0.5116, 0.2222)]));
+        s.on_frame(frame(&[(1, 0.9378, 0.6368), (2, 0.5116, 0.2222)]));
+        s.on_frame(frame(&[(1, 0.9378, 0.6364), (2, 0.5130, 0.2218)]));
+        s.on_frame(frame(&[(1, 0.9384, 0.6360), (2, 0.5148, 0.2214)]));
+        s.on_frame(frame(&[(1, 0.9384, 0.6360), (2, 0.5168, 0.2214)]));
+        s.on_frame(frame(&[(1, 0.9384, 0.6356), (2, 0.5182, 0.2214)]));
+        s.on_frame(frame(&[(1, 0.9388, 0.6352), (2, 0.5182, 0.2226)]));
+        s.on_frame(frame(&[(1, 0.9388, 0.6348), (2, 0.5172, 0.2256)]));
+        s.on_frame(frame(&[(1, 0.9398, 0.6246), (2, 0.5110, 0.2344)]));
+        s.on_frame(frame(&[(1, 0.9378, 0.5958), (2, 0.5024, 0.2454)]));
+        s.on_frame(frame(&[(1, 0.9340, 0.5684), (2, 0.4944, 0.2526)]));
+        s.on_frame(frame(&[(1, 0.9354, 0.5510), (2, 0.4880, 0.2578)]));
+        s.on_frame(frame(&[(1, 0.9388, 0.5388), (2, 0.4848, 0.2602)]));
+        s.on_frame(frame(&[(1, 0.9408, 0.5316), (2, 0.4824, 0.2628)]));
+        s.on_frame(frame(&[(1, 0.9418, 0.5266), (2, 0.4800, 0.2674)]));
+        s.on_frame(frame(&[]));
+        let log = r.pop();
+        assert!(
+            log.iter().any(|l| l.starts_with("rotate") && l.contains("Began")),
+            "expected rotate Began, got: {log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            "expected pinch Began, got: {log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l.starts_with("rotate") && l.contains("Changed")),
+            "expected rotate Changed once rotation dominates a frame, got: {log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l.starts_with("pinch") && l.contains("Changed")),
+            "expected pinch Changed (lock-frame pinch delta), got: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            "must not lock pan: {log:?}"
+        );
+    }
+
+    /// Anti-parallel diagonal motion that's mostly rotation around the
+    /// centroid but carries ~4% radial spread as a side effect.
+    /// Reproduces the SoflePLUS2 hardware case from /tmp/rotate.txt:99-109
+    /// — c0 went (-0.79, +0.28) mm and c1 went (+0.67, -1.10) mm by
+    /// lock; the angle change reached 4.5° while the distance grew
+    /// 4.1%. Both streams must report Began (the gesture has both
+    /// rotational and radial signal) and Changed deltas with the
+    /// expected signs — distance grew so the first pinch Changed must
+    /// be positive, and the angle decreased so the first rotate Changed
+    /// must be negative.
+    #[test]
+    fn antiparallel_diagonal_motion_emits_both_pinch_and_rotate() {
+        let r = Recorder::default();
+        let mut s = State::new(&r);
+        // Coordinates pulled from /tmp/rotate.txt:99-109, normalized
+        // onto the 50 mm test pad. Real device is 49×65 mm but the
+        // test geometry only needs the relative motion to match.
+        s.on_frame(frame(&[(1, 0.4450, 0.4722), (2, 0.8632, 0.6368)]));
+        s.on_frame(frame(&[(1, 0.4408, 0.4706), (2, 0.8732, 0.6250)]));
+        s.on_frame(frame(&[(1, 0.4374, 0.4706), (2, 0.8752, 0.6186)]));
+        s.on_frame(frame(&[(1, 0.4350, 0.4710), (2, 0.8756, 0.6170)]));
+        s.on_frame(frame(&[(1, 0.4292, 0.4778), (2, 0.8766, 0.6148)]));
+        s.on_frame(frame(&[]));
+        let log = r.pop();
+        assert!(
+            log.iter().any(|l| l.starts_with("rotate") && l.contains("Began")),
+            "expected rotate Began, got: {log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            "expected pinch Began, got: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            "must not lock pan: {log:?}"
+        );
+    }
+
+    /// Anchored-finger rotate where the "anchored" finger has tiny
+    /// same-direction drift (sensor noise, finger settling). Reproduces
+    /// the SoflePLUS2 hardware case from /tmp/rotate.txt:184 — c0 drifted
+    /// (+0.05, +0.04) mm by lock while c1 swept tangentially. With the
+    /// previous strictly-greater `common > differential` gate, those few
+    /// hundredths of a mm flipped pan_qualified true, pan_score raced to
+    /// ~3.5 (≈ |db|/0.8), and locked pan well before rot crossed 1.0.
+    /// The min-per-finger floor disqualifies pan when one contact has
+    /// barely moved, so rotate wins on the frame the angle threshold
+    /// actually triggers.
+    #[test]
+    fn anchored_finger_rotate_with_drift_locks_rotate_not_pan() {
+        let r = Recorder::default();
+        let mut s = State::new(&r);
+        // c0 (id=1) at (15, 20) mm, c1 (id=2) at (15, 40) mm — 20 mm
+        // apart vertically. Frames advance c1 along an arc around c0
+        // (clockwise on screen, +x with slight -y as it sweeps off the
+        // vertical) while c0 jitters ~(+0.05, +0.04) mm by lock — the
+        // exact magnitude observed on the failing hardware run.
+        s.on_frame(frame(&[(1, 0.300, 0.400), (2, 0.300, 0.800)]));
+        s.on_frame(frame(&[(1, 0.3001, 0.4001), (2, 0.301, 0.7998)]));
+        s.on_frame(frame(&[(1, 0.3002, 0.4002), (2, 0.310, 0.7994)]));
+        s.on_frame(frame(&[(1, 0.3004, 0.4003), (2, 0.328, 0.7984)]));
+        s.on_frame(frame(&[(1, 0.3010, 0.4008), (2, 0.3556, 0.7962)]));
+        s.on_frame(frame(&[]));
+        let log = r.pop();
+        assert!(
+            log.iter().any(|l| l.starts_with("rotate") && l.contains("Began")),
+            "expected rotate lock, got: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            "must not lock pan: {log:?}"
         );
     }
 
