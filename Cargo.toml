@@ -8,6 +8,10 @@ publish = false
 name = "companion"
 path = "src/main.rs"
 
+[[bin]]
+name = "gesture-tap"
+path = "src/bin/gesture_tap.rs"
+
 [dependencies]
 core-foundation     = "0.10"
 core-foundation-sys = "0.8"

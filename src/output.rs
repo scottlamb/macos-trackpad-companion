@@ -218,10 +218,149 @@ fn iohid_gesture_phase(phase: Phase) -> u32 {
 /// (used by Hammerspoon's `tl_CGEventCreateFromGesture` and the older
 /// MultitouchSupport sources). The synthesizer writes this to CGEvent
 /// field 0x6E ("gestureSubtype") on the `NSEventTypeGesture` (29)
-/// wrapper.
+/// wrapper. Used for magnify/rotate; 3F/4F swipes go through the
+/// DockControl path below — calftrail's `kTLInfoSubtypeSwipe` (0x10) is
+/// a legacy NSEventTypeSwipe shape that modern macOS Mission Control /
+/// Spaces no longer consume.
 const GESTURE_SUBTYPE_ROTATE: u32 = 0x05;
 const GESTURE_SUBTYPE_MAGNIFY: u32 = 0x08;
-const GESTURE_SUBTYPE_SWIPE: u32 = 0x10;
+
+// ---------- DockControl swipe synthesis ----------
+//
+// macOS routes 3F/4F swipes through `kCGSEventDockControl` events
+// (event-type-field 55 = 30) carrying `kIOHIDEventTypeDockSwipe`
+// (field 110 = 23). Both axes go through the same envelope:
+// motion field 123 = 1 (horizontal Spaces / full-screen apps) or
+// 2 (vertical Mission Control / App Exposé). Direction is encoded
+// in the *sign* of the cumulative-progress (124) and end-velocity
+// (129/130) fields — not in the flag-bits field, despite iss.c's
+// `right ? 1 : 0` shortcut. Empirically verified by tapping a real
+// MBP trackpad: every gesture (left/right/up/down) emits hid=23 with
+// matching motion + signed progress/velocity.
+//
+// Each DockControl event must be followed by a "companion"
+// `kCGSEventGesture` event (field 55 = 29). Without the companion the
+// Dock's state machine drops the dock event as orphaned.
+//
+// To get the rubber-band animation, the Dock needs a *stream* of
+// Changed events with progress walking smoothly from ~0 toward the
+// final value over real wall-clock time (~400 ms, ~20 events on the
+// captured MBP). A degenerate Begin → End pair commits but skips the
+// animation — that's iss.c's "instant swipe" trick. `Emitter::swipe`
+// is therefore live-driven by the gesture engine: each chip frame's
+// finger motion produces one Changed event, and lift produces Ended.
+// That mirrors what the real driver does and lets the user reverse
+// or abort mid-gesture exactly like a real trackpad.
+const FIELD_CGS_EVENT_TYPE: u32 = 55;
+const FIELD_GESTURE_HID_TYPE: u32 = 110;
+const FIELD_GESTURE_SCROLL_Y: u32 = 119;
+const FIELD_GESTURE_SWIPE_MOTION: u32 = 123;
+const FIELD_GESTURE_SWIPE_PROGRESS: u32 = 124;
+/// Per-event X-component of the swipe motion delta. For horizontal
+/// swipes the MBP capture shows this matches the per-event change in
+/// `FIELD_GESTURE_SWIPE_PROGRESS` (124); for vertical swipes it's
+/// near-zero noise.
+const FIELD_GESTURE_DELTA_X: u32 = 125;
+/// Per-event Y-component of the swipe motion delta, **negated**. For
+/// vertical swipes the MBP capture shows this is `-Δ124`; for
+/// horizontal swipes it's near-zero noise. The Dock uses the
+/// relative magnitudes of 125 and 126 to route the swipe to the
+/// horizontal Spaces handler vs. vertical Mission Control / Exposé —
+/// the easily-set motion field (123/165) appears to be advisory only,
+/// since the OS clamped our 123=2 / 165=2 writes to 1 regardless of
+/// event source. Sending the per-axis delta is what actually drives
+/// the routing decision.
+const FIELD_GESTURE_DELTA_Y_NEG: u32 = 126;
+const FIELD_GESTURE_SWIPE_VELOCITY_X: u32 = 129;
+const FIELD_GESTURE_SWIPE_VELOCITY_Y: u32 = 130;
+const FIELD_GESTURE_PHASE: u32 = 132;
+/// Mirror of [`FIELD_GESTURE_PHASE`]: every MBP-trackpad dock-swipe
+/// event sets 132 and 134 to the same phase value. iss.c's "instant
+/// commit" path sets only 132 and works for *horizontal* commits, so
+/// it skipped 134 — but 134 is load-bearing for the Dock's natural
+/// rubber-band animation and (empirically) for routing vertical
+/// motion to Mission Control / App Exposé instead of falling through
+/// to the horizontal handler. Without 134, motion=2 events were
+/// being treated as horizontal swipes with the same direction sign.
+const FIELD_GESTURE_PHASE_DUP: u32 = 134;
+const FIELD_SCROLL_GESTURE_FLAG_BITS: u32 = 135;
+/// Always 1 in every MBP-trackpad dock-swipe event. Purpose unclear;
+/// included on the assumption that it's another Dock-side validity
+/// check that may help routing.
+const FIELD_GESTURE_CONST_136: u32 = 136;
+/// Always 3 in every MBP-trackpad dock-swipe event. Same rationale
+/// as field 136.
+const FIELD_GESTURE_CONST_138: u32 = 138;
+/// "Required, reason unknown" per the iss.c reverse-engineering
+/// comment — set to FLT_TRUE_MIN (smallest positive subnormal f32) on
+/// every dock swipe event or the Dock silently ignores it.
+const FIELD_GESTURE_ZOOM_DELTA_X: u32 = 139;
+/// Mirror of [`FIELD_GESTURE_SWIPE_MOTION`] (123). Every MBP-trackpad
+/// dock-swipe event sets 123 and 165 to the same motion-axis value.
+/// This is the most likely missing field for vertical-swipe routing —
+/// the Dock appears to check 165 (not 123) when deciding whether to
+/// dispatch the gesture to the horizontal Spaces handler vs. the
+/// vertical Mission Control / Exposé handler.
+const FIELD_GESTURE_SWIPE_MOTION_DUP: u32 = 165;
+
+const CGS_EVENT_TYPE_GESTURE: i64 = 29;
+const CGS_EVENT_TYPE_DOCK_CONTROL: i64 = 30;
+const IOHID_EVENT_TYPE_DOCK_SWIPE: i64 = 23;
+const SWIPE_MOTION_HORIZONTAL: i64 = 1;
+const SWIPE_MOTION_VERTICAL: i64 = 2;
+
+const SWIPE_PHASE_BEGAN: i64 = 1;
+const SWIPE_PHASE_CHANGED: i64 = 2;
+const SWIPE_PHASE_ENDED: i64 = 4;
+
+// ---------- Vertical-swipe Dock-notification fallback ----------
+//
+// macOS clamps our synthetic dock-control `motion=2` to `1` regardless
+// of event source, included fields, or per-axis delta components —
+// every vertical swipe we synthesize gets routed to the horizontal
+// Spaces handler. Synthetic Ctrl+Up keystrokes also don't fire
+// Mission Control (the WindowServer hot-key dispatcher gates on
+// keystate signals we can't fake from userspace).
+//
+// Hammerspoon's `hs.spaces.toggleMissionControl` (extensions/spaces/
+// libspaces.m:241) sidesteps both paths and calls a private
+// `CoreDockSendNotification(CFSTR("com.apple.expose.awake"), 0)`
+// directly — the Dock owns Mission Control / App Exposé and listens
+// for these notification names. The symbol is exported from the
+// dyld shared cache (no on-disk framework binary on modern macOS),
+// so we resolve it at runtime via `dlsym(RTLD_DEFAULT, ...)` rather
+// than committing to a specific `-framework` link that might break
+// across macOS versions.
+
+/// Notification name that toggles Mission Control. From
+/// hammerspoon/extensions/spaces/spaces.lua:258.
+const DOCK_NOTIF_MISSION_CONTROL: &str = "com.apple.expose.awake";
+/// Notification name that toggles App Exposé. From
+/// hammerspoon/extensions/spaces/spaces.lua:272.
+const DOCK_NOTIF_APP_EXPOSE: &str = "com.apple.expose.front.awake";
+
+/// Cumulative-progress threshold above which a vertical swipe commits
+/// the Mission Control / Exposé toggle. With
+/// [`SWIPE_PROGRESS_REF_MM`] = 50mm, 0.2 ≈ 10mm of finger travel —
+/// large enough to clearly distinguish from a 3F tap or accidental
+/// drift past the axis-lock threshold (3mm), small enough that a
+/// natural quick flick (10–15mm) reliably fires. The horizontal /
+/// dock-control path uses MBP's commit threshold of ~0.5 because
+/// that's what the Dock itself enforces; vertical is up to us since
+/// we own the trigger via `CoreDockSendNotification`.
+const SWIPE_VERTICAL_COMMIT_PROGRESS: f64 = 0.2;
+
+/// Soft cap on the End-event velocity (mm/s). The Dock interprets
+/// large lift velocities as a deliberate flick and commits the
+/// transition with little or no animation; capturing the MBP trackpad
+/// shows its driver lands in the 3–7 mm/s range even after a brisk
+/// swipe (the EMA tracks deceleration into the lift). Our raw
+/// gesture-engine EMA can land much higher when the user lifts while
+/// still moving, which would feel "abrupt" relative to the MBP
+/// baseline. Saturating at this value keeps fast swipes from flicking
+/// past the natural feel without changing slow ones at all. Tunable.
+const SWIPE_END_VELOCITY_MAX: f64 = 8.0;
+
 
 /// Magic CGEventFlags value calftrail's gesture synthesizer sets on the
 /// envelope event before serialization (`CGEventSetFlags(e, 256)`).
@@ -263,6 +402,7 @@ unsafe extern "C" {
     fn CGEventSetFlags(event: CGEventRef, flags: u64);
     fn CGEventSetTimestamp(event: CGEventRef, ts: u64);
     fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
+    fn CGEventSetDoubleValueField(event: CGEventRef, field: u32, value: f64);
     fn CGEventCreateData(allocator: *const c_void, event: CGEventRef) -> *mut c_void;
     fn CGEventCreateFromData(allocator: *const c_void, data: *const c_void) -> CGEventRef;
     fn CGEventPost(tap: u32, event: CGEventRef);
@@ -289,7 +429,18 @@ struct Event(CGEventRef);
 
 impl Event {
     fn new() -> Option<Self> {
-        let raw = unsafe { CGEventCreate(std::ptr::null_mut()) };
+        Self::with_source(std::ptr::null_mut())
+    }
+
+    /// Create an event with an explicit `CGEventSource`. Some CGEvent
+    /// fields are silently normalized when the event has a NULL source
+    /// (e.g. dock-control swipe motion=2 was being clamped to 1 on
+    /// vertical swipes — the OS treats null-sourced gesture events as
+    /// untrusted and forces them onto the horizontal-Spaces handler).
+    /// Pass the persistent `kCGEventSourceStateCombinedSessionState`
+    /// source from `Emitter` to keep the value the caller wrote.
+    fn with_source(source: CGEventSourceRef) -> Option<Self> {
+        let raw = unsafe { CGEventCreate(source) };
         if raw.is_null() {
             None
         } else {
@@ -307,6 +458,9 @@ impl Event {
 
     fn set_int(&self, field: u32, value: i64) {
         unsafe { CGEventSetIntegerValueField(self.0, field, value) };
+    }
+    fn set_dbl(&self, field: u32, value: f64) {
+        unsafe { CGEventSetDoubleValueField(self.0, field, value) };
     }
     fn post(&self) {
         unsafe { CGEventPost(kCGHIDEventTap, self.0) };
@@ -416,13 +570,12 @@ struct SystemQueueElement {
 }
 
 /// Per-subtype payload value for the synthesized gesture event. Each
-/// variant maps to a specific CGEvent field id (0x71/0x72/0x73). The
-/// `None` case is for Began-/Ended-phase magnify and rotate events
-/// where the value is implicitly 0.
+/// variant maps to a specific CGEvent field id (0x71/0x72). The
+/// 0-value case is implicit for Began-/Ended-phase magnify and rotate
+/// events.
 enum GesturePayload {
     Magnification(f32),
     Rotation(f32),
-    SwipeDirection(u32),
 }
 
 /// Append a single CGEvent-serialized field entry: 2 bytes big-endian
@@ -607,7 +760,6 @@ fn synthesize_gesture_event(subtype: u32, phase: u32, payload: GesturePayload) -
     match payload {
         GesturePayload::Magnification(m) => append_field_f32(gesture_data, 0x71, m),
         GesturePayload::Rotation(r) => append_field_f32(gesture_data, 0x72, r),
-        GesturePayload::SwipeDirection(d) => append_field_u32(gesture_data, 0x73, d),
     }
     append_field_f32(gesture_data, 0x8B, 0.0);
     append_field_f32(gesture_data, 0x8C, 0.0);
@@ -647,12 +799,15 @@ pub enum Phase {
     Cancelled,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum SwipeDirection {
-    Left,
-    Right,
-    Up,
-    Down,
+/// Axis along which a multi-finger swipe is accumulating progress.
+/// Selected by the gesture engine on first significant motion (whichever
+/// of horizontal/vertical dominates) and held for the rest of the
+/// gesture so a wandering centroid doesn't flip the swipe sideways
+/// mid-flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwipeAxis {
+    Horizontal,
+    Vertical,
 }
 
 /// Trait surface a gesture engine sees. Implemented by [`Emitter`]
@@ -678,7 +833,17 @@ pub trait Output {
     fn cancel_inertia(&self) -> bool;
     fn pinch(&self, delta: f64, phase: Phase);
     fn rotate(&self, delta_degrees: f64, phase: Phase);
-    fn swipe(&self, direction: SwipeDirection);
+    /// Drive a multi-finger swipe live. `signed_progress` is the
+    /// cumulative finger displacement along `axis`, normalized so that
+    /// ±1.0 ≈ "user has clearly committed to the swipe". Sign carries
+    /// direction (positive = right / down). `velocity_mm_per_sec` is
+    /// only meaningful at `Phase::Ended` (drives the Dock's
+    /// commit-vs-rubber-band decision); pass 0 for other phases.
+    /// Phase brackets the gesture exactly like `scroll`: Began on the
+    /// first emit after axis lock, Changed each subsequent frame,
+    /// Ended on lift / finger-count drop. Implementations may track
+    /// state across calls; `Cancelled` clears any in-flight stream.
+    fn swipe(&self, axis: SwipeAxis, signed_progress: f64, velocity_mm_per_sec: f64, phase: Phase);
 }
 
 pub struct Emitter {
@@ -716,6 +881,17 @@ pub struct Emitter {
     /// once at `new()`; the timer ref inside is None except while a
     /// coast is in flight.
     momentum: Box<Momentum>,
+    /// Axis of the in-flight swipe, if any. Held across `swipe` calls
+    /// so Ended posts to the same axis the stream was opened on, even
+    /// if the gesture engine's motion estimate jitters between
+    /// horizontal and vertical near the diagonal. None when no swipe
+    /// is active.
+    swipe_axis: Cell<Option<SwipeAxis>>,
+    /// Previous `signed_progress` value posted on this swipe stream,
+    /// for computing the per-event delta needed by the X/Y motion-
+    /// component fields (125/126) the Dock reads to route horizontal
+    /// vs. vertical. Reset to 0 on each Began.
+    swipe_last_progress: Cell<f64>,
 }
 
 /// Inertia state. All cells are accessed only from the main run loop
@@ -776,6 +952,8 @@ impl Emitter {
                 timer_ref: Cell::new(std::ptr::null_mut()),
                 began_posted: Cell::new(false),
             }),
+            swipe_axis: Cell::new(None),
+            swipe_last_progress: Cell::new(0.0),
         }
     }
 
@@ -993,33 +1171,257 @@ impl Emitter {
         }
     }
 
-    /// Emit a 3-finger swipe in `direction`. macOS treats 3F swipe as a
-    /// discrete navigation event (Safari back/forward, etc.). The
-    /// IOHID `IOHIDSwipeMask` enum encodes direction as a bitfield:
-    /// up=1, down=2, left=4, right=8.
-    pub fn swipe(&self, direction: SwipeDirection) {
+    /// Drive a 3F/4F swipe live, mirroring the per-frame motion the
+    /// gesture engine sees. macOS routes these through the Dock as
+    /// `kCGSEventDockControl` events (field 55 = 30) carrying
+    /// `kIOHIDEventTypeDockSwipe` (110 = 23). Both horizontal Spaces
+    /// and vertical-axis swipes use the same envelope; only the
+    /// motion-axis field (123) and the sign of progress differ.
+    ///
+    /// The Dock plays its rubber-band animation in response to the
+    /// Changed event stream at wall-clock pacing — a degenerate
+    /// Begin→End pair commits without animating. The user can also
+    /// reverse direction or release short to abort, just like a real
+    /// trackpad, because progress is driven by their actual finger
+    /// position.
+    ///
+    /// Sign convention (matches the captured MBP-trackpad shape):
+    /// - Horizontal: positive = swipe-left finger motion, switches to
+    ///   the space on the right (macOS natural-scrolling default).
+    /// - Vertical: positive = swipe-up finger motion. (Whether this
+    ///   triggers Mission Control vs. App Exposé is up to the Dock and
+    ///   not yet fully reverse-engineered for synthetic events; the
+    ///   captured shape is identical for both.)
+    pub fn swipe(&self, axis: SwipeAxis, signed_progress: f64, velocity_mm_per_sec: f64, phase: Phase) {
         if !self.cfg.private_gestures {
-            log::debug!(
-                "post: swipe {:?} suppressed (private_gestures=false)",
-                direction
+            log::trace!(
+                "post: swipe {:?} {:?} suppressed (private_gestures=false)",
+                axis, phase,
             );
             return;
         }
-        let mask: u32 = match direction {
-            SwipeDirection::Up => 1,
-            SwipeDirection::Down => 2,
-            SwipeDirection::Left => 4,
-            SwipeDirection::Right => 8,
-        };
-        if let Some(e) = synthesize_gesture_event(
-            GESTURE_SUBTYPE_SWIPE,
-            0,
-            GesturePayload::SwipeDirection(mask),
-        ) {
-            log::debug!("post: swipe {:?}", direction);
-            e.post_to(kCGSessionEventTap);
+        // Vertical swipes route through the keyboard-shortcut fallback,
+        // not dock-control: the OS clamps motion=2 → 1 on synthetic
+        // events, so a dock-control vertical swipe is indistinguishable
+        // from a horizontal one and would inadvertently switch spaces.
+        // Fire the discrete shortcut only on commit; intermediate
+        // phases produce no output (no live rubber-band, but Mission
+        // Control / Exposé are inherently discrete actions).
+        if matches!(axis, SwipeAxis::Vertical) {
+            if matches!(phase, Phase::Ended) && signed_progress.abs() >= SWIPE_VERTICAL_COMMIT_PROGRESS {
+                let (notif, label) = if signed_progress < 0.0 {
+                    (DOCK_NOTIF_MISSION_CONTROL, "Mission Control")
+                } else {
+                    (DOCK_NOTIF_APP_EXPOSE, "App Exposé")
+                };
+                log::debug!(
+                    "post: vertical swipe → {} via CoreDockSendNotification (progress={:+.3})",
+                    label, signed_progress,
+                );
+                send_dock_notification(notif);
+            } else {
+                log::trace!(
+                    "post: vertical swipe {:?} progress={:+.3} (no-op until Ended past ±{})",
+                    phase, signed_progress, SWIPE_VERTICAL_COMMIT_PROGRESS,
+                );
+            }
+            return;
         }
+        let motion = match axis {
+            SwipeAxis::Horizontal => SWIPE_MOTION_HORIZONTAL,
+            SwipeAxis::Vertical => SWIPE_MOTION_VERTICAL,
+        };
+        let dock_phase = match phase {
+            Phase::Began => SWIPE_PHASE_BEGAN,
+            Phase::Changed => SWIPE_PHASE_CHANGED,
+            Phase::Ended | Phase::Cancelled => SWIPE_PHASE_ENDED,
+        };
+        // Only Began establishes the active axis; Changed/Ended on a
+        // foreign axis would split the event stream across two
+        // gestures, which the Dock interprets as cancellation. Began
+        // also resets the per-stream `last_progress` so the first
+        // Began event's delta-x/y fields aren't inherited from the
+        // previous gesture.
+        match phase {
+            Phase::Began => {
+                self.swipe_axis.set(Some(axis));
+                self.swipe_last_progress.set(0.0);
+            }
+            Phase::Ended | Phase::Cancelled => self.swipe_axis.set(None),
+            Phase::Changed => {}
+        }
+        // Per-event delta along the locked axis. The Dock reads this
+        // (split into X- and Y-components in fields 125/126) to route
+        // the swipe — it appears to ignore the easily-set motion
+        // field (123/165), since the OS clamped our writes to 1
+        // regardless of source. With 125/126 zero (our prior shape),
+        // every swipe was getting routed as horizontal-with-no-motion
+        // and falling through to the Spaces handler.
+        let delta = signed_progress - self.swipe_last_progress.get();
+        self.swipe_last_progress.set(signed_progress);
+        let (delta_x, delta_y_neg) = match axis {
+            // Horizontal: per-event X delta carries the motion;
+            // Y-component is zero. Sign of delta matches sign of
+            // progress for forward motion, flips for reversal.
+            SwipeAxis::Horizontal => (delta, 0.0),
+            // Vertical: per-event Y delta (with the MBP convention
+            // of inverted Y in field 126: positive when finger moves
+            // up, i.e. opposite the screen-Y / cumulative-progress
+            // sign). X-component is zero.
+            SwipeAxis::Vertical => (0.0, -delta),
+        };
+        let flag = if signed_progress >= 0.0 { 1 } else { 0 };
+        let velocity = matches!(phase, Phase::Ended).then(|| {
+            // Saturating cap: preserve sign, clamp magnitude. See
+            // SWIPE_END_VELOCITY_MAX docs for why — keeps fast-lift
+            // commits in the MBP-natural-feel range.
+            velocity_mm_per_sec.clamp(-SWIPE_END_VELOCITY_MAX, SWIPE_END_VELOCITY_MAX)
+        });
+        log::trace!(
+            "post: swipe axis={:?} motion={} flag={} progress={:+.3} delta_x={:+.4} delta_y_neg={:+.4} v={:+.1} (capped {:+.1}) phase={:?}",
+            axis,
+            motion,
+            flag,
+            signed_progress,
+            delta_x,
+            delta_y_neg,
+            velocity_mm_per_sec,
+            velocity.unwrap_or(0.0),
+            phase,
+        );
+        post_dock_swipe_pair(
+            self.event_source,
+            motion,
+            flag,
+            dock_phase,
+            velocity,
+            signed_progress,
+            delta_x,
+            delta_y_neg,
+        );
     }
+}
+
+/// Function pointer signature for `CoreDockSendNotification`. Symbol
+/// is exported from the dyld shared cache (no on-disk framework
+/// binary). Resolved on first use via `dlsym(RTLD_DEFAULT, …)` and
+/// cached. Returns 0 on success, nonzero CGError otherwise.
+type CoreDockSendNotificationFn =
+    unsafe extern "C" fn(notification: *const c_void, unknown: i32) -> i32;
+
+/// Send a notification name to the Dock via the private
+/// `CoreDockSendNotification` function — same path Hammerspoon's
+/// `hs.spaces.toggleMissionControl` and `toggleAppExpose` use. Logs
+/// and no-ops if the symbol can't be resolved or the call fails (the
+/// alternative — keyboard or dock-control synthesis — is what we
+/// fell back from, and there's no fourth path to try).
+fn send_dock_notification(name: &str) {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
+    use std::sync::OnceLock;
+
+    static FN_PTR: OnceLock<Option<CoreDockSendNotificationFn>> = OnceLock::new();
+    let f = FN_PTR.get_or_init(|| {
+        // RTLD_DEFAULT only sees symbols from libraries already mapped
+        // into the process. We don't link anything that drags this in,
+        // so dlopen it explicitly first. Confirmed via
+        // `dyld_info -all_dyld_cache -exports`: the symbol lives in
+        // ApplicationServices.framework/Frameworks/HIServices.framework,
+        // not SkyLight as the framework name might suggest. The
+        // framework is in the dyld shared cache (no on-disk binary on
+        // modern macOS); dlopen knows to look there for canonical
+        // /System paths.
+        let framework = c"/System/Library/Frameworks/ApplicationServices.framework/Frameworks/HIServices.framework/HIServices";
+        let handle = unsafe { libc::dlopen(framework.as_ptr(), libc::RTLD_LAZY) };
+        if handle.is_null() {
+            let err = unsafe {
+                let p = libc::dlerror();
+                if p.is_null() {
+                    "(no error)".to_string()
+                } else {
+                    std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+                }
+            };
+            log::warn!(
+                "dlopen SkyLight.framework failed ({err}); \
+                 vertical swipe → Mission Control / Exposé will not fire"
+            );
+            return None;
+        }
+        let symbol = c"CoreDockSendNotification";
+        let raw = unsafe { libc::dlsym(handle, symbol.as_ptr()) };
+        if raw.is_null() {
+            log::warn!(
+                "CoreDockSendNotification not found in HIServices.framework; \
+                 vertical swipe → Mission Control / Exposé will not fire"
+            );
+            None
+        } else {
+            // SAFETY: the symbol exists and matches the documented
+            // signature (verified via Hammerspoon's
+            // extensions/spaces/private.h).
+            Some(unsafe { std::mem::transmute::<*mut c_void, CoreDockSendNotificationFn>(raw) })
+        }
+    });
+    let Some(f) = f else { return };
+    let cf_name = CFString::new(name);
+    let rc = unsafe { f(cf_name.as_concrete_TypeRef() as *const c_void, 0) };
+    if rc != 0 {
+        log::warn!("CoreDockSendNotification({name:?}, 0) returned {rc}");
+    }
+}
+
+/// Build and post a single (DockControl + companion gesture) pair on
+/// the session event tap. `source` is the persistent
+/// `kCGEventSourceStateCombinedSessionState` source from the Emitter —
+/// passing NULL here causes the OS to clamp the motion field (123)
+/// from 2 to 1 on vertical swipes, routing them to the horizontal
+/// Spaces handler. Verified empirically: identical event shape posted
+/// with NULL source vs. session source differs only in the stored
+/// motion value.
+///
+/// The companion is a bare `CGEventCreate(source); set field 55 = 29`
+/// — no other fields. Without it, AppKit's gesture pipeline drops the
+/// dock event as orphaned. `velocity` and `progress` are both signed
+/// (sign carries direction). The real driver writes the velocity to
+/// *both* fields 129 and 130 regardless of motion axis; matching that
+/// here.
+fn post_dock_swipe_pair(
+    source: CGEventSourceRef,
+    motion: i64,
+    flag: i64,
+    phase: i64,
+    velocity: Option<f64>,
+    progress: f64,
+    delta_x: f64,
+    delta_y_neg: f64,
+) {
+    let Some(dock) = Event::with_source(source) else { return };
+    dock.set_int(FIELD_CGS_EVENT_TYPE, CGS_EVENT_TYPE_DOCK_CONTROL);
+    dock.set_int(FIELD_GESTURE_HID_TYPE, IOHID_EVENT_TYPE_DOCK_SWIPE);
+    dock.set_int(FIELD_GESTURE_PHASE, phase);
+    dock.set_int(FIELD_GESTURE_PHASE_DUP, phase);
+    dock.set_int(FIELD_SCROLL_GESTURE_FLAG_BITS, flag);
+    dock.set_int(FIELD_GESTURE_SWIPE_MOTION, motion);
+    dock.set_int(FIELD_GESTURE_SWIPE_MOTION_DUP, motion);
+    dock.set_int(FIELD_GESTURE_CONST_136, 1);
+    dock.set_int(FIELD_GESTURE_CONST_138, 3);
+    dock.set_dbl(FIELD_GESTURE_SCROLL_Y, 0.0);
+    // FLT_TRUE_MIN = smallest positive subnormal f32 ≈ 1.4e-45. The
+    // Dock checks this field is non-zero; using the smallest possible
+    // value avoids implying any actual zoom motion.
+    dock.set_dbl(FIELD_GESTURE_ZOOM_DELTA_X, f64::from(f32::from_bits(1)));
+    dock.set_dbl(FIELD_GESTURE_SWIPE_PROGRESS, progress);
+    dock.set_dbl(FIELD_GESTURE_DELTA_X, delta_x);
+    dock.set_dbl(FIELD_GESTURE_DELTA_Y_NEG, delta_y_neg);
+    if let Some(v) = velocity {
+        dock.set_dbl(FIELD_GESTURE_SWIPE_VELOCITY_X, v);
+        dock.set_dbl(FIELD_GESTURE_SWIPE_VELOCITY_Y, v);
+    }
+    let Some(companion) = Event::with_source(source) else { return };
+    companion.set_int(FIELD_CGS_EVENT_TYPE, CGS_EVENT_TYPE_GESTURE);
+    dock.post_to(kCGSessionEventTap);
+    companion.post_to(kCGSessionEventTap);
 }
 
 /// Post a single phased scroll event. Exactly one of `scroll_phase` and
@@ -1239,6 +1641,17 @@ impl Drop for Emitter {
         // `cancel` may post a final MomentumPhase::Ended via the event
         // source, so the source release has to come after.
         self.momentum.cancel();
+        // Bracket any in-flight swipe with an Ended on the same axis
+        // so the Dock doesn't leave the gesture half-open across our
+        // shutdown. Sign of 0 progress is positive ⇒ flag = 1, fine
+        // for cleanup since the Dock cancels at zero progress anyway.
+        if let Some(axis) = self.swipe_axis.take() {
+            let motion = match axis {
+                SwipeAxis::Horizontal => SWIPE_MOTION_HORIZONTAL,
+                SwipeAxis::Vertical => SWIPE_MOTION_VERTICAL,
+            };
+            post_dock_swipe_pair(self.event_source, motion, 1, SWIPE_PHASE_ENDED, Some(0.0), 0.0, 0.0, 0.0);
+        }
         if !self.event_source.is_null() {
             unsafe { CFRelease(self.event_source as *const c_void) };
         }
@@ -1273,7 +1686,7 @@ impl Output for Emitter {
     fn rotate(&self, delta_degrees: f64, phase: Phase) {
         Emitter::rotate(self, delta_degrees, phase);
     }
-    fn swipe(&self, direction: SwipeDirection) {
-        Emitter::swipe(self, direction);
+    fn swipe(&self, axis: SwipeAxis, signed_progress: f64, velocity_mm_per_sec: f64, phase: Phase) {
+        Emitter::swipe(self, axis, signed_progress, velocity_mm_per_sec, phase);
     }
 }

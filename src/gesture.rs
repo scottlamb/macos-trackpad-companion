@@ -6,7 +6,7 @@
 //! [`crate::report::Frame`] and an [`Output`] sink — so the heuristics
 //! can be unit-tested.
 
-use crate::output::{MouseButton, Output, Phase, SwipeDirection};
+use crate::output::{MouseButton, Output, Phase, SwipeAxis};
 use crate::report::{Contact, Frame};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -41,8 +41,17 @@ const PINCH_LOCK_RATIO: f64 = 0.04;
 /// Angle change (radians) needed to lock 2F mode = rotate.
 const ROTATE_LOCK_RAD: f64 = 6.0_f64 * std::f64::consts::PI / 180.0;
 
-/// Centroid travel needed to fire a 3F or 4F swipe.
-const SWIPE_TRIGGER_MM: f64 = 5.0;
+/// Centroid travel needed to lock the swipe axis (horizontal vs
+/// vertical). Below this, the gesture is still ambiguous; we wait
+/// rather than picking an axis off centroid jitter.
+const SWIPE_AXIS_LOCK_MM: f64 = 3.0;
+/// Physical finger travel (mm) along the locked swipe axis that
+/// corresponds to ±1.0 progress in the dock-control event. The Dock's
+/// commit threshold is around ±0.5, so a ~25 mm swipe (half of the
+/// reference) reliably commits — matches what feels natural on a
+/// 50 mm-tall trackpad without making short swipes accidentally
+/// trigger. Tunable.
+const SWIPE_PROGRESS_REF_MM: f64 = 50.0;
 
 /// EMA weight on the freshest velocity sample during 2F pan, in [0, 1].
 /// 0.4 ≈ 2.5-frame averaging window on a ~125 Hz pad — fast enough to
@@ -106,6 +115,29 @@ struct TwoFingerBaseline {
 #[derive(Clone, Copy, Debug)]
 struct MultiBaseline {
     initial_centroid: (f64, f64),
+    /// Locked swipe axis. None until cumulative centroid motion
+    /// crosses [`SWIPE_AXIS_LOCK_MM`]; after that, the dominant
+    /// component (whichever of horizontal/vertical is larger at the
+    /// moment of lock) is held for the rest of the gesture so a
+    /// wandering centroid near the diagonal doesn't flip the swipe
+    /// sideways mid-flight.
+    axis: Option<SwipeAxis>,
+    /// True after `Output::swipe(.., Phase::Began)` has been posted
+    /// for the current stream. Gates the corresponding Ended on lift /
+    /// finger-count drop so we don't emit an orphaned Ended on a
+    /// gesture that never crossed the axis-lock threshold.
+    began_posted: bool,
+    /// Most recent centroid sample. Used to derive the per-frame
+    /// motion delta for velocity tracking; avoids re-deriving from
+    /// each contact's previous-frame state.
+    last_centroid: (f64, f64),
+    /// Wall-clock time of `last_centroid`. None on the first frame
+    /// (no meaningful dt yet).
+    last_centroid_time: Option<Instant>,
+    /// EMA-smoothed centroid velocity in mm/s along (X, Y). Carried
+    /// to the Ended event as the lift-velocity signal that the Dock
+    /// uses to decide commit-vs-rubber-band.
+    velocity: (f64, f64),
 }
 
 /// Carry-over state from a 2F touch whose fingers lifted asynchronously
@@ -232,6 +264,16 @@ impl<O: Output> State<O> {
     }
 
     fn classify(&self, n: usize) -> GestureKind {
+        // Once a swipe has fired, stay latched until every finger leaves
+        // the pad. Asynchronous lifts (3 → 2 → 1 → 0 across a few chip
+        // frames) would otherwise reclassify as TwoFingerUnclassified
+        // then OneFinger, and the close-out branches would fire a
+        // spurious right-click on the brief 2F window (seen at
+        // /tmp/companion-logs.txt run 2: 10 ms after swipe Up, contact 1
+        // lifted before contacts 0 and 2 → 2f tap: click Right).
+        if matches!(self.kind, GestureKind::SwipeLatched) && n > 0 {
+            return GestureKind::SwipeLatched;
+        }
         match n {
             0 => GestureKind::Idle,
             1 => GestureKind::OneFinger,
@@ -242,12 +284,20 @@ impl<O: Output> State<O> {
                 | GestureKind::TwoFingerUnclassified => self.kind,
                 _ => GestureKind::TwoFingerUnclassified,
             },
+            // Treat 3⇄4 as the same in-flight gesture: a finger
+            // landing or lifting mid-swipe must NOT close out the
+            // current dock-control stream and start a fresh one,
+            // because Ended → Began on the same continuous motion
+            // looks like cancellation to the Dock and would split the
+            // user's swipe into two short segments. Hold the kind
+            // through that transition; the close-out only fires when
+            // the user drops below 3 fingers entirely.
             3 => match self.kind {
-                GestureKind::ThreeFingerLive | GestureKind::SwipeLatched => self.kind,
+                GestureKind::ThreeFingerLive | GestureKind::FourFingerLive => self.kind,
                 _ => GestureKind::ThreeFingerLive,
             },
             _ => match self.kind {
-                GestureKind::FourFingerLive | GestureKind::SwipeLatched => self.kind,
+                GestureKind::ThreeFingerLive | GestureKind::FourFingerLive => self.kind,
                 _ => GestureKind::FourFingerLive,
             },
         }
@@ -441,6 +491,45 @@ impl<O: Output> State<O> {
                     }
                 }
             }
+            GestureKind::ThreeFingerLive | GestureKind::FourFingerLive => {
+                // Reaching this arm means the user dropped from 3+
+                // fingers (the 3⇄4 case is held in `classify`). If a
+                // swipe was actually in flight (axis locked AND Began
+                // was emitted), close it out with an Ended that carries
+                // the EMA-smoothed lift-velocity along the locked axis
+                // — that's the signal the Dock uses to commit-vs-
+                // rubber-band the gesture.
+                if let Some(b) = self.multi_baseline
+                    && b.began_posted
+                    && let Some(axis) = b.axis
+                {
+                    let cumulative_mm = match axis {
+                        SwipeAxis::Horizontal => b.last_centroid.0 - b.initial_centroid.0,
+                        SwipeAxis::Vertical => b.last_centroid.1 - b.initial_centroid.1,
+                    };
+                    let progress = cumulative_mm / SWIPE_PROGRESS_REF_MM;
+                    let velocity = match axis {
+                        SwipeAxis::Horizontal => b.velocity.0,
+                        SwipeAxis::Vertical => b.velocity.1,
+                    };
+                    log::debug!(
+                        "swipe: ended axis={:?} progress={:+.3} v={:+.1}mm/s",
+                        axis, progress, velocity,
+                    );
+                    self.out.swipe(axis, progress, velocity, Phase::Ended);
+                    // Treat the post-swipe residual fingers (e.g. async
+                    // lift 3 → 2 → 0) the same way we treat post-tap
+                    // residuals: lock out further gestures until full
+                    // lift, so brief 2F windows don't fire spurious
+                    // right-clicks.
+                    self.kind = GestureKind::SwipeLatched;
+                    self.started_at = now;
+                    self.max_move_sq = 0.0;
+                    self.two_baseline = None;
+                    self.multi_baseline = None;
+                    return;
+                }
+            }
             _ => {}
         }
 
@@ -483,6 +572,11 @@ impl<O: Output> State<O> {
                 let cy: f64 = active.iter().map(|c| c.y).sum::<f64>() / active.len() as f64;
                 self.multi_baseline = Some(MultiBaseline {
                     initial_centroid: (cx, cy),
+                    axis: None,
+                    began_posted: false,
+                    last_centroid: (cx, cy),
+                    last_centroid_time: None,
+                    velocity: (0.0, 0.0),
                 });
             }
             _ => {}
@@ -497,7 +591,7 @@ impl<O: Output> State<O> {
             | GestureKind::TwoFingerPan
             | GestureKind::TwoFingerPinch
             | GestureKind::TwoFingerRotate => self.dispatch_two(active, now),
-            GestureKind::ThreeFingerLive | GestureKind::FourFingerLive => self.dispatch_swipe(active),
+            GestureKind::ThreeFingerLive | GestureKind::FourFingerLive => self.dispatch_swipe(active, now),
         }
     }
 
@@ -699,8 +793,8 @@ impl<O: Output> State<O> {
         self.two_baseline = Some(base);
     }
 
-    fn dispatch_swipe(&mut self, active: &[Contact]) {
-        let Some(base) = self.multi_baseline else {
+    fn dispatch_swipe(&mut self, active: &[Contact], now: Instant) {
+        let Some(mut base) = self.multi_baseline else {
             return;
         };
         let cx: f64 = active.iter().map(|c| c.x).sum::<f64>() / active.len() as f64;
@@ -708,33 +802,54 @@ impl<O: Output> State<O> {
         let dx = cx - base.initial_centroid.0;
         let dy = cy - base.initial_centroid.1;
 
-        let dir = if dx.abs() >= dy.abs() {
-            if dx >= SWIPE_TRIGGER_MM {
-                Some(SwipeDirection::Right)
-            } else if dx <= -SWIPE_TRIGGER_MM {
-                Some(SwipeDirection::Left)
-            } else {
-                None
+        // Lock the swipe axis on first significant centroid motion.
+        // Holding the axis for the rest of the gesture means a slight
+        // wander near the diagonal can't flip the swipe sideways
+        // mid-flight (which would bracket the in-flight stream with a
+        // foreign-axis Began the Dock interprets as cancellation).
+        if base.axis.is_none() {
+            if dx.abs() < SWIPE_AXIS_LOCK_MM && dy.abs() < SWIPE_AXIS_LOCK_MM {
+                base.last_centroid = (cx, cy);
+                self.multi_baseline = Some(base);
+                return;
             }
-        } else if dy >= SWIPE_TRIGGER_MM {
-            Some(SwipeDirection::Down)
-        } else if dy <= -SWIPE_TRIGGER_MM {
-            Some(SwipeDirection::Up)
-        } else {
-            None
-        };
-
-        if let Some(direction) = dir {
-            log::debug!(
-                "swipe: {:?} (n_fingers={} centroid_d=({:+.2},{:+.2})mm)",
-                direction,
-                active.len(),
-                dx,
-                dy,
-            );
-            self.out.swipe(direction);
-            self.kind = GestureKind::SwipeLatched;
+            base.axis = Some(if dx.abs() >= dy.abs() {
+                SwipeAxis::Horizontal
+            } else {
+                SwipeAxis::Vertical
+            });
         }
+        let axis = base.axis.expect("axis just locked");
+
+        // Update EMA velocity on the locked axis.
+        if let Some(prev_t) = base.last_centroid_time {
+            let dt = (now - prev_t).as_secs_f64().max(1e-3);
+            let inst_vx = (cx - base.last_centroid.0) / dt;
+            let inst_vy = (cy - base.last_centroid.1) / dt;
+            base.velocity.0 =
+                SCROLL_VELOCITY_ALPHA * inst_vx + (1.0 - SCROLL_VELOCITY_ALPHA) * base.velocity.0;
+            base.velocity.1 =
+                SCROLL_VELOCITY_ALPHA * inst_vy + (1.0 - SCROLL_VELOCITY_ALPHA) * base.velocity.1;
+        }
+        base.last_centroid = (cx, cy);
+        base.last_centroid_time = Some(now);
+
+        let signed_progress = match axis {
+            SwipeAxis::Horizontal => dx / SWIPE_PROGRESS_REF_MM,
+            SwipeAxis::Vertical => dy / SWIPE_PROGRESS_REF_MM,
+        };
+        let phase = if base.began_posted {
+            Phase::Changed
+        } else {
+            base.began_posted = true;
+            log::debug!(
+                "swipe: began axis={:?} progress={:+.3} (n_fingers={})",
+                axis, signed_progress, active.len(),
+            );
+            Phase::Began
+        };
+        self.out.swipe(axis, signed_progress, /* velocity */ 0.0, phase);
+        self.multi_baseline = Some(base);
     }
 }
 
@@ -810,8 +925,10 @@ mod tests {
                 .borrow_mut()
                 .push(format!("rotate {delta:.4} {phase:?}"));
         }
-        fn swipe(&self, direction: SwipeDirection) {
-            self.log.borrow_mut().push(format!("swipe {direction:?}"));
+        fn swipe(&self, axis: SwipeAxis, signed_progress: f64, velocity: f64, phase: Phase) {
+            self.log.borrow_mut().push(format!(
+                "swipe {axis:?} {signed_progress:+.3} v={velocity:+.1} {phase:?}"
+            ));
         }
     }
 
@@ -991,14 +1108,56 @@ mod tests {
     }
 
     #[test]
-    fn three_finger_swipe_left() {
+    fn three_finger_swipe_left_emits_horizontal_negative_progress() {
         let r = Recorder::default();
         let mut s = State::new(&r);
+        // Three fingers move 10mm left across 3 frames (50mm pad,
+        // 0.1 normalized = 5mm; 0.5 → 0.3 = 10mm). That's well past
+        // SWIPE_AXIS_LOCK_MM (3mm) so the gesture locks Horizontal
+        // and emits Began with negative progress (finger moved left).
         s.on_frame(frame(&[(1, 0.5, 0.5), (2, 0.55, 0.5), (3, 0.6, 0.5)]));
         s.on_frame(frame(&[(1, 0.4, 0.5), (2, 0.45, 0.5), (3, 0.5, 0.5)]));
         s.on_frame(frame(&[(1, 0.3, 0.5), (2, 0.35, 0.5), (3, 0.4, 0.5)]));
         let log = r.pop();
-        assert!(log.iter().any(|l| l.contains("swipe Left")), "{log:?}");
+        assert!(
+            log.iter().any(|l| l.contains("Horizontal") && l.contains("Began") && l.contains('-')),
+            "expected Horizontal Began with negative progress, got: {log:?}",
+        );
+    }
+
+    /// Reproduces the spurious right-click seen at
+    /// /tmp/companion-logs.txt:67 — after a 3F swipe up fired, the
+    /// fingers lifted asynchronously (3 → 2 → 0 across two chip
+    /// frames). Without the SwipeLatched stay-latched guard, the
+    /// brief 2F window reclassified as TwoFingerUnclassified and the
+    /// 2F → Idle close-out fired a Right click 10 ms later.
+    #[test]
+    fn async_lift_after_swipe_does_not_fire_click() {
+        let r = Recorder::default();
+        let mut s = State::new(&r);
+        s.on_frame(frame(&[(1, 0.4, 0.5), (2, 0.5, 0.5), (3, 0.6, 0.5)]));
+        s.on_frame(frame(&[(1, 0.4, 0.3), (2, 0.5, 0.3), (3, 0.6, 0.3)]));
+        // Swipe Began should have fired by here — drain the log.
+        let mid = r.pop();
+        assert!(
+            mid.iter().any(|l| l.contains("Vertical") && l.contains("Began")),
+            "{mid:?}",
+        );
+        // Async lift: contact 2 lifts first (only 1 and 3 remain),
+        // then all lift on the next frame. This is the exact pattern
+        // that produced the spurious right-click on the SoflePLUS2.
+        s.on_frame(frame(&[(1, 0.4, 0.3), (3, 0.6, 0.3)]));
+        s.on_frame(frame(&[]));
+        let log = r.pop();
+        assert!(
+            !log.iter().any(|l| l.starts_with("click")),
+            "post-swipe async lift must not fire any click, got: {log:?}",
+        );
+        // We do expect an Ended on the swipe stream itself.
+        assert!(
+            log.iter().any(|l| l.contains("Vertical") && l.contains("Ended")),
+            "expected swipe Ended on lift, got: {log:?}",
+        );
     }
 
     // ── Scenarios ported from rmk's TrackpadProcessor tests ──
