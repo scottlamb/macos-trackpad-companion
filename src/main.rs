@@ -18,6 +18,7 @@ mod report;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use output::SwipeBackend;
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -30,10 +31,25 @@ struct Args {
     #[arg(long, value_parser = parse_hex_u16)]
     pid: Option<u16>,
 
-    /// Disable private CGEvent gesture-type injection. Pinch/rotate/swipe
-    /// fall back to keyboard-shortcut emulation (poor UX) or no-op.
+    /// Disable private CGEvent gesture-type injection for pinch and rotate.
+    /// Doesn't affect swipes — those have their own per-axis backend (see
+    /// --swipe-h / --swipe-v), including a non-private notification fallback.
     #[arg(long)]
     no_private_gestures: bool,
+
+    /// Backend for left/right (horizontal) 3F/4F swipes — Spaces and
+    /// Full-Screen Apps. `synthetic` posts trackpad DockSwipe events
+    /// for an animated transition; `notification` is silently treated
+    /// as `off` here (no Dock notification for switching Spaces).
+    #[arg(long, value_enum, default_value_t = SwipeBackend::Synthetic)]
+    swipe_h: SwipeBackend,
+
+    /// Backend for up/down (vertical) 3F/4F swipes — Mission Control
+    /// and App Exposé. `synthetic` animates via DockSwipe events;
+    /// `notification` fires the discrete Dock notification on lift past
+    /// a commit threshold (no live animation).
+    #[arg(long, value_enum, default_value_t = SwipeBackend::Synthetic)]
+    swipe_v: SwipeBackend,
 
     /// Screen pixels per millimeter of finger motion. Higher = faster
     /// cursor. Independent of pad density; ~25 matches the old default's
@@ -74,10 +90,12 @@ fn main() -> Result<()> {
         .init();
 
     log::info!(
-        "magic-trackpad-companion starting (vid={:?} pid={:?} private_gestures={})",
+        "magic-trackpad-companion starting (vid={:?} pid={:?} private_gestures={} swipe_h={:?} swipe_v={:?})",
         args.vid,
         args.pid,
-        !args.no_private_gestures
+        !args.no_private_gestures,
+        args.swipe_h,
+        args.swipe_v,
     );
 
     let cfg = output::Config {
@@ -85,6 +103,8 @@ fn main() -> Result<()> {
         scroll_accel: args.scroll_accel,
         natural_scroll: !args.invert_scroll,
         private_gestures: !args.no_private_gestures,
+        horizontal_swipe: args.swipe_h,
+        vertical_swipe: args.swipe_v,
     };
     let emitter = output::Emitter::new(cfg);
     let mut state = gesture::State::new(emitter);

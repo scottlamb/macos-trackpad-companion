@@ -56,8 +56,9 @@ const ROTATE_LOCK_RAD: f64 = 4.0_f64 * std::f64::consts::PI / 180.0;
 /// rather than picking an axis off centroid jitter.
 const SWIPE_AXIS_LOCK_MM: f64 = 3.0;
 /// Physical finger travel (mm) along the locked swipe axis that
-/// corresponds to ±1.0 progress in the dock-control event. The Dock's
-/// commit threshold is around ±0.5, so a ~25 mm swipe (half of the
+/// corresponds to ±1.0 progress in the synthesized DockSwipe event.
+/// The Dock's commit threshold is around ±0.5, so a ~25 mm swipe
+/// (half of the
 /// reference) reliably commits — matches what feels natural on a
 /// 50 mm-tall trackpad without making short swipes accidentally
 /// trigger. Tunable.
@@ -356,7 +357,7 @@ impl<O: Output> State<O> {
             },
             // Treat 3⇄4 as the same in-flight gesture: a finger
             // landing or lifting mid-swipe must NOT close out the
-            // current dock-control stream and start a fresh one,
+            // current DockSwipe stream and start a fresh one,
             // because Ended → Began on the same continuous motion
             // looks like cancellation to the Dock and would split the
             // user's swipe into two short segments. Hold the kind

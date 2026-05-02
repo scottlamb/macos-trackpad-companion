@@ -11,8 +11,8 @@
 //! progress range the real driver emits.
 //!
 //! Listens on `kCGSessionEventTap` for `kCGSEventGesture` (29) and
-//! `kCGSEventDockControl` (30). Modeled on joshuarli/iss/iss.c, but
-//! with the suppression and synthesis ripped out — observation only.
+//! `kCGSEventDockControl` (30). Field names follow Apple's WebKit
+//! test SPI header `CoreGraphicsTestSPI.h` (BSD-2-Clause).
 
 #![allow(non_upper_case_globals)]
 
@@ -53,11 +53,12 @@ const kCGSessionEventTap: u32 = 1;
 const kCGHeadInsertEventTap: u32 = 0;
 const kCGEventTapOptionListenOnly: u32 = 1;
 
+// CGSEventType values + CGEventField indices from
+// `WebKit/Tools/TestRunnerShared/spi/CoreGraphicsTestSPI.h`.
 const kCGSEventGesture: i64 = 29;
 const kCGSEventDockControl: i64 = 30;
-
-const FIELD_CGS_EVENT_TYPE: u32 = 55;
-const FIELD_GESTURE_HID_TYPE: u32 = 110;
+const kCGSEventTypeField: u32 = 55;
+const kCGEventGestureHIDType: u32 = 110;
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
@@ -76,11 +77,11 @@ extern "C" fn callback(
     if ty == 0xFFFFFFFE || ty == 0xFFFFFFFF {
         return event;
     }
-    let cgs_type = unsafe { CGEventGetIntegerValueField(event, FIELD_CGS_EVENT_TYPE) };
+    let cgs_type = unsafe { CGEventGetIntegerValueField(event, kCGSEventTypeField) };
     if cgs_type != kCGSEventGesture && cgs_type != kCGSEventDockControl {
         return event;
     }
-    let hid_type = unsafe { CGEventGetIntegerValueField(event, FIELD_GESTURE_HID_TYPE) };
+    let hid_type = unsafe { CGEventGetIntegerValueField(event, kCGEventGestureHIDType) };
     let label = if cgs_type == kCGSEventGesture {
         "Gesture"
     } else {
@@ -89,7 +90,7 @@ extern "C" fn callback(
     let mut int_fields = String::new();
     let mut dbl_fields = String::new();
     for f in 100u32..=200 {
-        if f == FIELD_GESTURE_HID_TYPE {
+        if f == kCGEventGestureHIDType {
             continue;
         }
         let i = unsafe { CGEventGetIntegerValueField(event, f) };
