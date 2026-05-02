@@ -986,8 +986,11 @@ impl Emitter {
         // (e.g. crossing to an adjacent monitor), post it as-is — clamping
         // to the source display's bounds would pin the cursor at the source
         // display's edge and prevent multi-monitor traversal entirely.
+        // NB: `displays_with_point` returns a Vec preallocated to at least
+        // length 1 even when no display matches — the real match count is
+        // in the second tuple field. Don't use `ids.is_empty()` here.
         let on_a_display = CGDisplay::displays_with_point(p, 1)
-            .map(|(ids, _)| !ids.is_empty())
+            .map(|(_, count)| count > 0)
             .unwrap_or(false);
         if !on_a_display {
             let bounds = display_bounds_for(from);
