@@ -1233,13 +1233,16 @@ impl Emitter {
     /// trackpad, because progress is driven by their actual finger
     /// position.
     ///
-    /// Sign convention (matches the captured MBP-trackpad shape):
-    /// - Horizontal: positive = swipe-left finger motion, switches to
-    ///   the space on the right (macOS natural-scrolling default).
-    /// - Vertical: positive = swipe-up finger motion. (Whether this
-    ///   triggers Mission Control vs. App Exposé is up to the Dock and
-    ///   not yet fully reverse-engineered for synthetic events; the
-    ///   captured shape is identical for both.)
+    /// Input sign convention (gesture-engine): positive `signed_progress`
+    /// = finger centroid moved in the +X (right) / +Y (down) direction
+    /// from the gesture's start. The Dock's wire convention for
+    /// horizontal is the opposite — positive progress on the captured
+    /// MBP shape corresponds to swipe-LEFT finger motion (switching to
+    /// the space on the right under natural scrolling) — so this
+    /// function negates the horizontal sign before sending. Vertical is
+    /// not flipped: the < 0 branch routes Mission Control (fingers up,
+    /// which is -Y in our coordinates) and the >= 0 branch routes App
+    /// Exposé.
     pub fn swipe(&self, axis: SwipeAxis, signed_progress: f64, velocity_mm_per_sec: f64, phase: Phase) {
         if !self.cfg.private_gestures {
             log::trace!(
@@ -1275,6 +1278,10 @@ impl Emitter {
             }
             return;
         }
+        // Convert horizontal from gesture-engine convention (positive =
+        // finger moved right) to the Dock's wire convention (positive =
+        // swipe-left). See the doc comment on this function.
+        let signed_progress = -signed_progress;
         let motion = match axis {
             SwipeAxis::Horizontal => SWIPE_MOTION_HORIZONTAL,
             SwipeAxis::Vertical => SWIPE_MOTION_VERTICAL,
