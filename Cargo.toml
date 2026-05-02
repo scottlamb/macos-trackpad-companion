@@ -3,6 +3,7 @@ name = "magic-trackpad-companion"
 version = "0.1.0"
 edition = "2024"
 publish = false
+default-run = "companion"
 
 [[bin]]
 name = "companion"

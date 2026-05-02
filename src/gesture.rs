@@ -194,6 +194,14 @@ pub struct State<O: Output> {
     /// from a tap-eligible 2F session — the suppress flag has no such
     /// payload, it just blocks the residual's own click path.
     suppress_one_finger_click: bool,
+    /// Last seen value of `Frame::button`. The PTP integrated button bit
+    /// originates upstream (firmware mirrors keymap-driven `MouseBtn1`),
+    /// so all this layer does is detect edges and forward them via
+    /// `Output::set_left_button_held` — which the emitter then turns
+    /// into LeftMouseDown/Up CGEvents and uses to switch cursor moves
+    /// over to LeftMouseDragged. Treated independently of finger
+    /// gestures (taps/scroll still classify normally while held).
+    prev_button: bool,
 }
 
 impl<O: Output> State<O> {
@@ -211,6 +219,7 @@ impl<O: Output> State<O> {
             pending_two_finger_tap: None,
             born_during_coast: false,
             suppress_one_finger_click: false,
+            prev_button: false,
         }
     }
 
@@ -222,6 +231,15 @@ impl<O: Output> State<O> {
     /// uses `on_frame`; tests use this so tap/hold thresholds can be
     /// exercised deterministically without sleeping.
     pub fn on_frame_at(&mut self, frame: Frame, now: Instant) {
+        // Forward integrated-button edges before the contact-driven
+        // gesture pipeline runs, so a press that arrives in the same
+        // frame as a finger movement turns into a real drag (the
+        // emitter promotes the subsequent move to `LeftMouseDragged`).
+        if frame.button != self.prev_button {
+            self.out.set_left_button_held(frame.button);
+            self.prev_button = frame.button;
+        }
+
         let active: Vec<Contact> = frame.contacts.iter().copied().filter(|c| c.tip).collect();
 
         // Refresh tracked-contact state (prev → current).
@@ -897,6 +915,11 @@ mod tests {
         fn click(&self, button: MouseButton) {
             self.log.borrow_mut().push(format!("click {button:?}"));
         }
+        fn set_left_button_held(&self, held: bool) {
+            self.log
+                .borrow_mut()
+                .push(format!("set_left_button_held {held}"));
+        }
         fn scroll(&self, dx: f64, dy: f64, phase: Phase) {
             self.log
                 .borrow_mut()
@@ -957,6 +980,60 @@ mod tests {
             scan_time_100us: 0,
             button: false,
         }
+    }
+
+    fn frame_with_button(contacts: &[(u8, f64, f64)], button: bool) -> Frame {
+        let mut f = frame(contacts);
+        f.button = button;
+        f
+    }
+
+    #[test]
+    fn button_press_then_release_forwards_held_edges() {
+        // Hardware-button drag: the firmware sets `Frame::button` while
+        // the user holds a key bound to MouseBtn1. The companion must
+        // surface those transitions verbatim — once on press, once on
+        // release — and nothing in between, regardless of how many
+        // identical-button frames stream through.
+        let r = Recorder::default();
+        let mut s = State::new(&r);
+        s.on_frame(frame_with_button(&[(1, 0.5, 0.5)], true));
+        s.on_frame(frame_with_button(&[(1, 0.6, 0.5)], true));
+        s.on_frame(frame_with_button(&[(1, 0.7, 0.5)], false));
+        let log = r.pop();
+        let edges: Vec<_> = log
+            .iter()
+            .filter(|l| l.starts_with("set_left_button_held"))
+            .collect();
+        assert_eq!(
+            edges,
+            vec![
+                &"set_left_button_held true".to_string(),
+                &"set_left_button_held false".to_string(),
+            ],
+            "{log:?}"
+        );
+    }
+
+    #[test]
+    fn button_held_without_finger_still_forwards_edges() {
+        // Firmware emits a button-only PTP report (contact_count=0,
+        // button=1) when the user presses MouseBtn1 without any finger
+        // on the pad. Companion must forward the edge — apps need the
+        // mouse-down before any drag motion arrives.
+        let r = Recorder::default();
+        let mut s = State::new(&r);
+        s.on_frame(frame_with_button(&[], true));
+        s.on_frame(frame_with_button(&[], false));
+        let log = r.pop();
+        assert!(
+            log.iter().any(|l| l == "set_left_button_held true"),
+            "{log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l == "set_left_button_held false"),
+            "{log:?}"
+        );
     }
 
     #[test]

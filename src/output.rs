@@ -116,6 +116,7 @@ const kCGEventLeftMouseUp: u32 = 2;
 const kCGEventRightMouseDown: u32 = 3;
 const kCGEventRightMouseUp: u32 = 4;
 const kCGEventMouseMoved: u32 = 5;
+const kCGEventLeftMouseDragged: u32 = 6;
 
 const kCGMouseButtonLeft: u32 = 0;
 const kCGMouseButtonRight: u32 = 1;
@@ -816,6 +817,14 @@ pub enum SwipeAxis {
 pub trait Output {
     fn move_cursor_by(&self, dx_mm: f64, dy_mm: f64);
     fn click(&self, button: MouseButton);
+    /// Latch the integrated touchpad button. Driven by the firmware's
+    /// PTP report bit (bit 0 = left), which in turn mirrors keymap-driven
+    /// `MouseBtn1` presses. While held, [`Self::move_cursor_by`] should
+    /// post `LeftMouseDragged` so apps see a real drag rather than a
+    /// move-while-button-pressed mismatch. Implementations are expected
+    /// to dedupe (called once per frame regardless of change) and only
+    /// post the corresponding mouse-down/up CGEvents on actual edges.
+    fn set_left_button_held(&self, held: bool);
     fn scroll(&self, dx_mm: f64, dy_mm: f64, phase: Phase);
     /// Seed scroll inertia from a just-ended pan. `vx_mm_per_sec` and
     /// `vy_mm_per_sec` are the EMA-smoothed centroid velocity at lift.
@@ -892,6 +901,12 @@ pub struct Emitter {
     /// component fields (125/126) the Dock reads to route horizontal
     /// vs. vertical. Reset to 0 on each Began.
     swipe_last_progress: Cell<f64>,
+    /// True between `LeftMouseDown` and `LeftMouseUp` posts. While set,
+    /// `move_cursor_by` emits `LeftMouseDragged` instead of
+    /// `MouseMoved` so apps see a real drag stream. Driven by
+    /// [`Output::set_left_button_held`], which the gesture engine
+    /// forwards from the firmware's PTP integrated-button bit.
+    left_button_held: Cell<bool>,
 }
 
 /// Inertia state. All cells are accessed only from the main run loop
@@ -954,6 +969,7 @@ impl Emitter {
             }),
             swipe_axis: Cell::new(None),
             swipe_last_progress: Cell::new(0.0),
+            left_button_held: Cell::new(false),
         }
     }
 
@@ -999,26 +1015,55 @@ impl Emitter {
             p.y =
                 p.y.clamp(bounds.origin.y, bounds.origin.y + bounds.size.height - 1.0);
         }
+        let event_type = if self.left_button_held.get() {
+            kCGEventLeftMouseDragged
+        } else {
+            kCGEventMouseMoved
+        };
         let Some(e) = Event::from_raw(unsafe {
-            CGEventCreateMouseEvent(
-                std::ptr::null_mut(),
-                kCGEventMouseMoved,
-                p,
-                kCGMouseButtonLeft,
-            )
+            CGEventCreateMouseEvent(std::ptr::null_mut(), event_type, p, kCGMouseButtonLeft)
         }) else {
             return;
         };
         e.set_int(kCGMouseEventDeltaX as u32, dx as i64);
         e.set_int(kCGMouseEventDeltaY as u32, dy as i64);
         log::trace!(
-            "post: mouseMoved d=({:+.1},{:+.1})px to=({:.0},{:.0})",
+            "post: {} d=({:+.1},{:+.1})px to=({:.0},{:.0})",
+            if self.left_button_held.get() { "leftMouseDragged" } else { "mouseMoved" },
             dx,
             dy,
             p.x,
             p.y
         );
         e.post();
+    }
+
+    pub fn set_left_button_held(&self, held: bool) {
+        if self.left_button_held.get() == held {
+            return;
+        }
+        self.left_button_held.set(held);
+        let p = self.cursor();
+        let event_type = if held {
+            kCGEventLeftMouseDown
+        } else {
+            kCGEventLeftMouseUp
+        };
+        log::debug!(
+            "post: leftMouse{} at=({:.0},{:.0})",
+            if held { "Down" } else { "Up" },
+            p.x,
+            p.y,
+        );
+        if let Some(e) = Event::from_raw(unsafe {
+            CGEventCreateMouseEvent(std::ptr::null_mut(), event_type, p, kCGMouseButtonLeft)
+        }) {
+            // Click-state 1 matches the firmware-button semantic: a single
+            // press, not a synthetic double/triple. Without setting this,
+            // some apps treat the down/up pair as count=0 and ignore it.
+            e.set_int(kCGMouseEventClickState, 1);
+            e.post();
+        }
     }
 
     pub fn click(&self, button: MouseButton) {
@@ -1673,6 +1718,9 @@ impl Output for Emitter {
     }
     fn click(&self, button: MouseButton) {
         Emitter::click(self, button);
+    }
+    fn set_left_button_held(&self, held: bool) {
+        Emitter::set_left_button_held(self, held);
     }
     fn scroll(&self, dx_mm: f64, dy_mm: f64, phase: Phase) {
         Emitter::scroll(self, dx_mm, dy_mm, phase);
