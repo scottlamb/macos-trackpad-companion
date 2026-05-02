@@ -36,6 +36,15 @@ const MOTION_DEAD_ZONE_MM: f64 = 0.04;
 
 /// Centroid pan distance needed to lock 2F mode = pan.
 const PAN_LOCK_MM: f64 = 0.4;
+/// Cosine-of-angle floor for the per-finger motion-direction gate in
+/// `pan_qualified`. Above this, both fingers are moving in essentially
+/// the same direction (within ~14°) and we treat the gesture as pan
+/// even when one finger lags the other. Picked between the anchored-
+/// rotate test's worst-case alignment (0.925) and the user's slow-
+/// scroll-with-lag observation (0.997). On the SoflePLUS2's small
+/// trackpad fingers crowd close enough that one lagging the other is
+/// the common case for a slow careful scroll.
+const PAN_ALIGNMENT_COS_MIN: f64 = 0.97;
 /// Distance-change ratio needed to lock 2F mode = pinch (unitless).
 const PINCH_LOCK_RATIO: f64 = 0.04;
 /// Angle change (radians) past which the 2F lock check considers
@@ -149,6 +158,15 @@ struct TwoFingerBaseline {
     /// new event's timestamp to compute the per-frame dt that turns a
     /// per-frame mm delta into a mm/sec velocity sample.
     last_scroll_time: Option<Instant>,
+    /// Set when a frame's pinch or rotate score crossed lock threshold
+    /// but a lenient pan signal (basic `common > differential * 1.2`,
+    /// ignoring the per-finger gate) was stronger — likely a slow scroll
+    /// where one finger trails the other and the strict balance gate
+    /// hasn't passed yet. We defer the pinch+rot lock by one frame to
+    /// give the slower finger a chance to catch up; the next pinch/rot
+    /// crossing commits regardless of pan's status. Bounded to one frame
+    /// so a real pinch only feels ~one chip-frame slower to onset.
+    pinch_rot_lock_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -618,6 +636,7 @@ impl<O: Output> State<O> {
                     pinch_rotate_dominant: PinchRotateDominant::Pinch,
                     scroll_velocity: (0.0, 0.0),
                     last_scroll_time: None,
+                    pinch_rot_lock_pending: false,
                 });
             }
             GestureKind::ThreeFingerLive | GestureKind::FourFingerLive => {
@@ -756,30 +775,45 @@ impl<O: Output> State<O> {
             let common_mag = (common.0.powi(2) + common.1.powi(2)).sqrt();
             let differential_mag =
                 (differential.0.powi(2) + differential.1.powi(2)).sqrt();
-            // Pan requires both fingers to participate roughly equally
-            // and in roughly the same direction. The strict
-            // `common > differential` test alone passes some non-pan
-            // gestures: an anchored-finger rotate where the pinned
-            // finger drifts a few hundredths of a mm in the same
-            // direction as the moving one tips the test true; an
-            // asymmetric gesture with c0 moving 1.5 mm and c1 moving
-            // 0.2 mm (the user's anchored-finger rotates that locked
-            // as scroll, /tmp/rotate.txt:315/414/760) does the same.
-            // Two extra gates close those holes:
+            // Pan requires both fingers to participate in roughly the
+            // same translation. Two gates filter pinch/rotate signals
+            // that masquerade as pan:
             //
-            // 1. Balance: the slower contact must move at least 30% of
-            //    the faster. Below that the gesture is dominated by
-            //    one finger — pinch/rotate territory, not pan.
-            // 2. Margin: |common| must beat |differential| by 20%, not
+            // A. Margin: |common| must beat |differential| by 20%, not
             //    just by epsilon. Near-perpendicular motion where the
             //    common-vs-differential test is right on the boundary
             //    isn't really "translation."
+            // B. Per-finger participation, satisfied by *either*:
+            //    - Balance: slower contact moves ≥ 30% of the faster.
+            //      Catches symmetric pan where both fingers contribute.
+            //    - Alignment: motion vectors point in nearly the same
+            //      direction (cos > PAN_ALIGNMENT_COS_MIN ≈ 14°). Catches
+            //      a slow scroll where one finger lags the other —
+            //      common when fingers are crammed close on a small
+            //      trackpad. Without this branch, the user's slow
+            //      careful scrolls on the SoflePLUS2 misclassified as
+            //      pinch+rotate (cf. /tmp/companion-logs ~2026-05-02:
+            //      one finger moved 2.3 mm while the other moved 0.3 mm
+            //      in the same direction; cos = 0.997, balance = 0.13).
+            //
+            // Both gates ride on top of the strict `common > differential`
+            // test, which alone passes anchored-finger rotates where the
+            // "anchored" finger drifts a few hundredths of a mm in the
+            // same direction as the sweeper.
             let da_mag = (da.0.powi(2) + da.1.powi(2)).sqrt();
             let db_mag = (db.0.powi(2) + db.1.powi(2)).sqrt();
             let min_per_finger = da_mag.min(db_mag);
             let max_per_finger = da_mag.max(db_mag);
+            // Cosine of the angle between the two motion vectors.
+            // Undefined when either is zero — fall through to balance.
+            let alignment = if da_mag > 0.0 && db_mag > 0.0 {
+                (da.0 * db.0 + da.1 * db.1) / (da_mag * db_mag)
+            } else {
+                -1.0
+            };
             let pan_qualified = common_mag > differential_mag * 1.2
-                && min_per_finger >= max_per_finger * 0.3;
+                && (min_per_finger >= max_per_finger * 0.3
+                    || alignment > PAN_ALIGNMENT_COS_MIN);
 
             let pan = if pan_qualified {
                 common_mag / PAN_LOCK_MM
@@ -798,6 +832,51 @@ impl<O: Output> State<O> {
                 let new_kind = if pan >= 1.0 && pan >= pinch && pan >= rot {
                     GestureKind::TwoFingerPan
                 } else {
+                    // Pinch or rot crossed but pan didn't (or didn't
+                    // dominate). Two patterns suggest the gesture is
+                    // really a slow scroll whose trailing finger just
+                    // hasn't caught up — defer the lock by one frame
+                    // (the next pinch/rot crossing commits regardless):
+                    //
+                    // A. Lenient pan signal stronger than pinch/rot.
+                    //    The basic `common > differential * 1.2` margin
+                    //    is already passing — centroid is translating —
+                    //    just the per-finger gate is failing. Reproduces
+                    //    /tmp/companion-logs 2026-05-02 05:13:52.562 (the
+                    //    user's scroll-down with horizontal twist:
+                    //    balance failed by a hair at 0.27<0.30, pinch
+                    //    crossed at 1.12, and the very next frame pan
+                    //    qualified with pan_score=4.54 dominating).
+                    // B. Motion vectors essentially parallel
+                    //    (alignment > 0.97). When one finger is near-
+                    //    anchored the basic margin test *can't* pass
+                    //    (|common|≈|differential|), so case A misses it.
+                    //    But cos≈1 is a strong "both fingers want the
+                    //    same direction" signal: most likely a lagging
+                    //    finger, not an anchored-rotate (which sits at
+                    //    cos≈0.73 in our test data). Reproduces
+                    //    /tmp/companion-logs 2026-05-02 05:27:35.439
+                    //    (rot crossed at 1.28 with cos=1.000, balance
+                    //    0.06, basic margin 1.13<1.2; one frame later
+                    //    pan qualified at 3.94).
+                    let pinch_or_rot = pinch.max(rot);
+                    let pan_lenient = if common_mag > differential_mag * 1.2 {
+                        common_mag / PAN_LOCK_MM
+                    } else {
+                        0.0
+                    };
+                    let aligned_motion = alignment > PAN_ALIGNMENT_COS_MIN;
+                    if (pan_lenient > pinch_or_rot || aligned_motion)
+                        && !base.pinch_rot_lock_pending
+                    {
+                        log::debug!(
+                            "pinch+rotate lock deferred: pan_lenient={:.2} alignment={:.3}",
+                            pan_lenient, alignment,
+                        );
+                        base.pinch_rot_lock_pending = true;
+                        self.two_baseline = Some(base);
+                        return;
+                    }
                     GestureKind::TwoFingerPinchAndRotate
                 };
                 self.kind = new_kind;
@@ -1330,8 +1409,11 @@ mod tests {
     /// scraped past the old min-per-finger floor. Reproduces
     /// /tmp/rotate.txt:411-413 (one of the unintended scroll locks
     /// during the user's pinch/rotate alternation session). The
-    /// balance-ratio gate (slower contact ≥ 30% of faster) is what
-    /// closes this hole.
+    /// balance-ratio gate (slower contact ≥ 30% of faster) plus the
+    /// alignment gate together close this hole. The lock-deferral
+    /// logic gives pan one extra frame to qualify; this test extends
+    /// across that frame to confirm pinch+rot still wins after the
+    /// defer when the strict gate stays false.
     #[test]
     fn asymmetric_directionally_correlated_motion_does_not_lock_pan() {
         let r = Recorder::default();
@@ -1342,11 +1424,124 @@ mod tests {
         s.on_frame(frame(&[(1, 0.2210, 0.5404), (2, 0.6306, 0.5090)]));
         s.on_frame(frame(&[(1, 0.2216, 0.5400), (2, 0.6360, 0.5032)]));
         s.on_frame(frame(&[(1, 0.2220, 0.5396), (2, 0.6426, 0.4976)]));
+        // One extra frame past the original test data so the deferral
+        // logic can resolve. Continues the same trend (c1 keeps
+        // creeping while c2 keeps sweeping) — alignment stays ~0.94
+        // (below threshold) and balance stays ~0.13 (below threshold),
+        // so pan never qualifies and pinch+rot must commit.
+        s.on_frame(frame(&[(1, 0.2222, 0.5394), (2, 0.6492, 0.4920)]));
         s.on_frame(frame(&[]));
         let log = r.pop();
         assert!(
             !log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
             "asymmetric motion must not classify as pan: {log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            "expected pinch+rot lock once deferral resolves: {log:?}"
+        );
+    }
+
+    /// Slow scroll where the trailing finger barely moves at all
+    /// (~3 mm/s vs. ~50 mm/s on the leader). Both fingers head in the
+    /// same direction (cos ≈ 1.0) but their magnitudes are so different
+    /// that |common| ≈ |differential|, which makes the basic
+    /// common-vs-differential 1.2× margin test fail at the lock frame
+    /// (1.13 < 1.2). With the basic margin failing, the lenient-pan
+    /// branch of the deferral logic sees pan=0 and won't trigger;
+    /// only the alignment branch (cos > PAN_ALIGNMENT_COS_MIN) catches
+    /// this case. One frame later the trailing finger has caught up
+    /// enough that the basic margin passes and pan_qualified flips
+    /// true. Reproduces /tmp/companion-logs.txt at 2026-05-02
+    /// 05:27:35.439 (rot_score=1.28, pinch_score=0.84 false lock; the
+    /// next frame pan_score=3.94 dominated rot=1.79).
+    #[test]
+    fn slow_scroll_with_near_anchored_trailing_finger_locks_pan() {
+        let r = Recorder::default();
+        let mut s = State::new(&r);
+        // mm coordinates / 50, taken from the user's hardware run.
+        s.on_frame(frame(&[(1, 0.2704, 0.7574), (2, 0.6292, 0.6898)]));
+        s.on_frame(frame(&[(1, 0.2722, 0.7430), (2, 0.6292, 0.6894)]));
+        s.on_frame(frame(&[(1, 0.2784, 0.7220), (2, 0.6298, 0.6876)]));
+        s.on_frame(frame(&[(1, 0.2852, 0.7038), (2, 0.6312, 0.6826)]));
+        s.on_frame(frame(&[(1, 0.2900, 0.6880), (2, 0.6322, 0.6746)]));
+        s.on_frame(frame(&[]));
+        let log = r.pop();
+        assert!(
+            log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            "expected pan lock after one-frame deferral, got: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            "must not lock pinch+rotate: {log:?}"
+        );
+    }
+
+    /// Slow scroll-down where the user's hand also drifts horizontally,
+    /// shrinking the inter-finger distance. The lock frame catches the
+    /// gesture mid-settle: balance fails by a hair (0.27 < 0.30),
+    /// alignment is poor (cos = 0.45) because the y-components agree
+    /// but the x-components diverge, so pan_qualified is false and
+    /// pinch crosses first at score 1.12. But |common| (1.08 mm,
+    /// dominantly south) already beats |differential| (0.85 mm) by
+    /// >20% — the basic margin test is passing — and one frame later
+    /// the trailing finger catches up enough that balance flips above
+    /// 0.30. The deferral logic gives pan that one frame to qualify.
+    /// Reproduces /tmp/companion-logs.txt at 2026-05-02 05:13:52.562
+    /// (pinch_score=1.12, rot_score=0.80 false lock).
+    #[test]
+    fn slow_scroll_with_horizontal_drift_locks_pan_after_one_frame_defer() {
+        let r = Recorder::default();
+        let mut s = State::new(&r);
+        // mm coordinates / 50: c0 sweeps south while c1 drifts east+south.
+        // y-components are aligned (both south); x-components diverge.
+        s.on_frame(frame(&[(1, 0.7168, 0.4774), (2, 0.2570, 0.6334)]));
+        s.on_frame(frame(&[(1, 0.7154, 0.4842), (2, 0.2570, 0.6334)]));
+        s.on_frame(frame(&[(1, 0.7140, 0.4968), (2, 0.2574, 0.6340)]));
+        s.on_frame(frame(&[(1, 0.7126, 0.5146), (2, 0.2656, 0.6390)]));
+        s.on_frame(frame(&[(1, 0.7102, 0.5336), (2, 0.2780, 0.6484)]));
+        s.on_frame(frame(&[(1, 0.7086, 0.5646), (2, 0.2828, 0.6666)]));
+        s.on_frame(frame(&[]));
+        let log = r.pop();
+        assert!(
+            log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            "expected pan lock after one-frame deferral, got: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            "must not lock pinch+rotate: {log:?}"
+        );
+    }
+
+    /// Slow careful scroll where one finger lags the other. Both
+    /// fingers move in essentially the same direction (cos ≈ 1.0) but
+    /// the trailing finger covers <15% as much ground. Without the
+    /// alignment override on `pan_qualified`, the balance gate (min ≥
+    /// 30% of max) disqualifies pan; pinch crosses first on the small
+    /// distance change between closely-spaced fingers, and the gesture
+    /// locks pinch+rotate. Reproduces /tmp/companion-logs.txt at
+    /// 2026-05-02 04:55:09.044 (pinch_score=1.00, rot_score=1.62 with
+    /// the user's actual finger coordinates from a SoflePLUS2 with
+    /// fingers ~17 mm apart — narrow span makes pinch hypersensitive).
+    #[test]
+    fn slow_scroll_with_finger_lag_locks_pan() {
+        let r = Recorder::default();
+        let mut s = State::new(&r);
+        // mm coordinates / 50: c0 sweeps ~2.3 mm south while c1 only
+        // shifts ~0.3 mm in the same direction.
+        s.on_frame(frame(&[(1, 0.7786, 0.3348), (2, 0.4360, 0.4008)]));
+        s.on_frame(frame(&[(1, 0.7780, 0.3454), (2, 0.4354, 0.4008)]));
+        s.on_frame(frame(&[(1, 0.7776, 0.3572), (2, 0.4350, 0.4024)]));
+        s.on_frame(frame(&[(1, 0.7690, 0.3808), (2, 0.4350, 0.4066)]));
+        s.on_frame(frame(&[]));
+        let log = r.pop();
+        assert!(
+            log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            "expected pan lock, got: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            "must not lock pinch+rotate: {log:?}"
         );
     }
 
