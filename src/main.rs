@@ -53,11 +53,32 @@ struct Args {
     #[arg(long, value_enum, default_value_t = SwipeBackend::Synthetic)]
     swipe_v: SwipeBackend,
 
-    /// Screen pixels per millimeter of finger motion. Higher = faster
-    /// cursor. Independent of pad density; ~25 matches the old default's
-    /// feel on a 65 mm-wide pad.
+    /// Cursor sensitivity: screen pixels per millimeter of finger
+    /// motion at the curve's reference velocity
+    /// (`--cursor-accel-ref`). With the default
+    /// `--cursor-accel-exponent=1.0` (linear), this value applies at
+    /// every speed — ~25 matches the old default's feel on a 65 mm-wide
+    /// pad. Pad-density independent.
     #[arg(long, default_value_t = 25.0)]
-    accel: f64,
+    sensitivity: f64,
+
+    /// Power-curve exponent for cursor acceleration. `1.0` (default)
+    /// is linear: `--sensitivity` pixels per mm regardless of speed.
+    /// Values `> 1` boost fast movements (cross-screen flicks) and
+    /// slow movements get sub-linear gain (more precision). Try
+    /// `1.3`–`1.5` for a moderate curve. `< 1` would invert that —
+    /// almost never useful for cursor (it's what `accelerate_scroll`
+    /// does for scrolls, where the goal is to tame fast flicks).
+    #[arg(long, default_value_t = 1.0)]
+    cursor_accel_exponent: f64,
+
+    /// Reference velocity (mm/s of finger travel) at which the curve
+    /// reproduces the linear `--sensitivity` feel. Below this → less
+    /// gain than linear; above this → more. Only matters when
+    /// `--cursor-accel-exponent` differs from 1. ~80 mm/s is roughly
+    /// "moving the cursor at conversational speed" on a small pad.
+    #[arg(long, default_value_t = 80.0)]
+    cursor_accel_ref: f64,
 
     /// Screen pixels per millimeter of finger motion in scroll mode.
     #[arg(long, default_value_t = 20.0)]
@@ -101,15 +122,19 @@ fn main() -> Result<()> {
     );
 
     let cfg = output::Config {
-        accel: args.accel,
         scroll_accel: args.scroll_accel,
         natural_scroll: !args.invert_scroll,
         private_gestures: !args.no_private_gestures,
         horizontal_swipe: args.swipe_h,
         vertical_swipe: args.swipe_v,
     };
+    let cursor_accel = gesture::CursorAccel {
+        px_per_mm_at_ref: args.sensitivity,
+        exponent: args.cursor_accel_exponent,
+        ref_mm_per_sec: args.cursor_accel_ref,
+    };
     let emitter = output::Emitter::new(cfg);
-    let mut state = gesture::State::new(emitter);
+    let mut state = gesture::State::new(emitter, cursor_accel);
 
     let mut manager = hid::Manager::new(hid::Filter {
         vid: args.vid,

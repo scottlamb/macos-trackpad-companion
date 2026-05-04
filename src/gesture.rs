@@ -71,6 +71,48 @@ const SWIPE_PROGRESS_REF_MM: f64 = 50.0;
 /// the inertia seed. Mirrors rmk's `VEL_EMA_NUM/VEL_EMA_DEN = 96/256`.
 const SCROLL_VELOCITY_ALPHA: f64 = 0.4;
 
+/// Fallback frame `dt` for the very first sampled frame of a gesture,
+/// before we have a previous frame to subtract from. ~8 ms matches a
+/// 125 Hz PTP pad, which both supported keyboards run at.
+const DEFAULT_FRAME_DT: Duration = Duration::from_micros(8000);
+
+/// Power-curve cursor acceleration parameters. The curve is
+/// `pixels_per_sec = c · |v|^E` (in finger mm/s → screen px/s), with
+/// `c` chosen so that at `v == ref_mm_per_sec` the result equals the
+/// linear `px_per_mm_at_ref · v`. Below `ref` → sub-linear gain (more
+/// precision for slow movements); above `ref` → super-linear gain
+/// (faster cross-screen movement). `exponent == 1.0` reduces to plain
+/// linear (`px_per_mm_at_ref` regardless of speed) so the curve is
+/// off-by-default.
+#[derive(Clone, Copy, Debug)]
+pub struct CursorAccel {
+    pub px_per_mm_at_ref: f64,
+    pub exponent: f64,
+    pub ref_mm_per_sec: f64,
+}
+
+impl Default for CursorAccel {
+    fn default() -> Self {
+        Self {
+            px_per_mm_at_ref: 25.0,
+            exponent: 1.0,
+            ref_mm_per_sec: 80.0,
+        }
+    }
+}
+
+/// Apply the cursor-acceleration curve to a per-axis velocity, returning
+/// pixels per second. Caller multiplies by per-frame `dt` for the
+/// per-frame pixel delta.
+fn accelerate_cursor(v_mm_per_sec: f64, cfg: CursorAccel) -> f64 {
+    let mag = v_mm_per_sec.abs();
+    if mag == 0.0 {
+        return 0.0;
+    }
+    let linear = cfg.px_per_mm_at_ref * cfg.ref_mm_per_sec.powf(1.0 - cfg.exponent);
+    v_mm_per_sec.signum() * linear * mag.powf(cfg.exponent)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Tracked {
     x: f64,
@@ -230,7 +272,27 @@ pub struct State<O: Output> {
     /// (the contact patch shrinks asymmetrically as the finger rolls
     /// off) that, if emitted, teleports the cursor on release. Costs
     /// ~one chip cycle of cursor latency for not getting that jump.
-    pending_motion: Option<(f64, f64)>,
+    /// Stored with the frame `dt` at sample time so the acceleration
+    /// curve runs on the right velocity when the value is finally
+    /// emitted on the *next* frame.
+    pending_motion: Option<(f64, f64, Duration)>,
+    /// Cursor-acceleration curve parameters. Held by the gesture
+    /// engine (not the platform output) so `Output::move_cursor_by`
+    /// only sees integer pixel deltas — keeps the curve testable
+    /// without faking out CGEvent.
+    cursor_accel: CursorAccel,
+    /// Sub-pixel residuals carried across frames for cursor motion.
+    /// Without these, integer truncation of `pixels_per_sec · dt`
+    /// drops up to one pixel per frame, which on slow precise
+    /// movement is the difference between motion and a stuck cursor.
+    /// Reset on transitions out of `OneFinger`.
+    cursor_carry_x_px: f64,
+    cursor_carry_y_px: f64,
+    /// Timestamp of the previous `on_frame_at` call. Used to derive
+    /// per-frame `dt`, which is stamped onto `pending_motion` so the
+    /// curve sees the actual sample interval (matters when chip
+    /// frames stretch — e.g. coalesced reports under load).
+    prev_frame_at: Option<Timestamp>,
     pending_two_finger_tap: Option<PendingTwoFingerTap>,
     /// Set on `Idle → non-Idle` transitions when `Output::cancel_inertia`
     /// reports a coast was actually live. Persists for the duration of
@@ -260,7 +322,7 @@ pub struct State<O: Output> {
 }
 
 impl<O: Output> State<O> {
-    pub fn new(out: O) -> Self {
+    pub fn new(out: O, cursor_accel: CursorAccel) -> Self {
         let now = Timestamp::now();
         Self {
             out,
@@ -271,6 +333,10 @@ impl<O: Output> State<O> {
             two_baseline: None,
             multi_baseline: None,
             pending_motion: None,
+            cursor_accel,
+            cursor_carry_x_px: 0.0,
+            cursor_carry_y_px: 0.0,
+            prev_frame_at: None,
             pending_two_finger_tap: None,
             born_during_coast: false,
             suppress_one_finger_click: false,
@@ -295,6 +361,21 @@ impl<O: Output> State<O> {
     /// deltas reflect the chip's scan cadence rather than report
     /// delivery cadence. Tests inject their own `now` directly.
     pub fn on_frame_at(&mut self, frame: Frame, now: Timestamp) {
+        // Frame interval used by the cursor-acceleration curve. `now`
+        // comes from `ScanTimeClock`, so the dt reflects the chip's
+        // actual scan cadence rather than report-delivery jitter.
+        // Clamp to a sane range so a long stall (or wall-clock jump)
+        // can't produce a one-frame velocity blowup or a near-zero
+        // dt that explodes the velocity. First-frame fallback matches
+        // a 125 Hz pad — the velocity that frame is dominated by the
+        // could-still-tap gate anyway, so the exact value barely
+        // matters.
+        let frame_dt = match self.prev_frame_at.replace(now) {
+            Some(prev) => now.saturating_duration_since(prev)
+                .clamp(Duration::from_millis(1), Duration::from_millis(100)),
+            None => DEFAULT_FRAME_DT,
+        };
+
         // Hand the frame timestamp to the output so per-frame CGEvents
         // (cursor moves, button down/up, scrolls, etc.) get stamped
         // with the host-aligned scan time rather than wall-clock now,
@@ -347,7 +428,7 @@ impl<O: Output> State<O> {
             self.transition(new_kind, &active, now);
         }
         if !active.is_empty() {
-            self.dispatch(&active, now);
+            self.dispatch(&active, now, frame_dt);
         }
     }
 
@@ -424,6 +505,13 @@ impl<O: Output> State<O> {
                 // transition to TwoFinger* it's stale single-finger
                 // motion that's no longer meaningful.
                 let dropped = self.pending_motion.take();
+                // Reset the sub-pixel carry so a fresh OneFinger
+                // session can't inherit a residual pixel from the
+                // previous one — without this, a long slow movement
+                // followed by a quick second touch could see a
+                // visible "jump-on-arrival" worth up to one pixel.
+                self.cursor_carry_x_px = 0.0;
+                self.cursor_carry_y_px = 0.0;
                 // A pending two-finger tap that doesn't get consumed by
                 // an Idle transition (e.g. the residual finger gets
                 // joined by a third — back to a 2F gesture) must be
@@ -668,10 +756,10 @@ impl<O: Output> State<O> {
         }
     }
 
-    fn dispatch(&mut self, active: &[Contact], now: Timestamp) {
+    fn dispatch(&mut self, active: &[Contact], now: Timestamp, frame_dt: Duration) {
         match self.kind {
             GestureKind::Idle | GestureKind::SwipeLatched => {}
-            GestureKind::OneFinger => self.dispatch_one(active, now),
+            GestureKind::OneFinger => self.dispatch_one(active, now, frame_dt),
             GestureKind::TwoFingerUnclassified
             | GestureKind::TwoFingerPan
             | GestureKind::TwoFingerPinchAndRotate => self.dispatch_two(active, now),
@@ -679,7 +767,7 @@ impl<O: Output> State<O> {
         }
     }
 
-    fn dispatch_one(&mut self, active: &[Contact], now: Timestamp) {
+    fn dispatch_one(&mut self, active: &[Contact], now: Timestamp, frame_dt: Duration) {
         let c = active[0];
         let Some(tr) = self.contacts.get(&c.id) else {
             return;
@@ -710,16 +798,48 @@ impl<O: Output> State<O> {
         // `pending_motion` without emitting it — that's what drops
         // the centroid-shift jump that capacitive trackpads commonly
         // report on the last with-finger frame.
-        if let Some((bdx, bdy)) = self.pending_motion.take() {
+        if let Some((bdx, bdy, bdt)) = self.pending_motion.take() {
             if bdx.abs() > MOTION_DEAD_ZONE_MM || bdy.abs() > MOTION_DEAD_ZONE_MM {
-                log::debug!(
-                    "cursor: emit deferred d=({:+.3},{:+.3})mm (cur frame at=({:.2},{:.2})mm)",
-                    bdx, bdy, c.x, c.y,
-                );
-                self.out.move_cursor_by(bdx, bdy);
+                let (dx_px, dy_px) = self.cursor_pixels_for(bdx, bdy, bdt);
+                if dx_px != 0 || dy_px != 0 {
+                    log::debug!(
+                        "cursor: emit deferred d=({:+.3},{:+.3})mm → ({:+},{:+})px \
+                         (cur frame at=({:.2},{:.2})mm)",
+                        bdx, bdy, dx_px, dy_px, c.x, c.y,
+                    );
+                    self.out.move_cursor_by(dx_px, dy_px);
+                }
             }
         }
-        self.pending_motion = Some((dx, dy));
+        self.pending_motion = Some((dx, dy, frame_dt));
+    }
+
+    /// Run the cursor-acceleration curve on a per-frame mm delta and
+    /// return integer pixel deltas, carrying the sub-pixel residual
+    /// across frames in `cursor_carry_*_px`. The curve is per-axis
+    /// (the Apple curve and most parametric ones do the same) so a
+    /// purely-vertical motion doesn't get amplified by an unrelated
+    /// horizontal velocity — it's the magnitude on that axis that
+    /// determines that axis's gain.
+    fn cursor_pixels_for(&mut self, dx_mm: f64, dy_mm: f64, dt: Duration) -> (i32, i32) {
+        let dt_s = dt.as_secs_f64();
+        // dt is clamped in `on_frame_at`, so this can't be zero. But
+        // if a future caller threads a different value through, fall
+        // back to a no-op rather than producing NaN.
+        if dt_s <= 0.0 {
+            return (0, 0);
+        }
+        let vx = dx_mm / dt_s;
+        let vy = dy_mm / dt_s;
+        let px_x = accelerate_cursor(vx, self.cursor_accel) * dt_s;
+        let px_y = accelerate_cursor(vy, self.cursor_accel) * dt_s;
+        let total_x = self.cursor_carry_x_px + px_x;
+        let total_y = self.cursor_carry_y_px + px_y;
+        let int_x = total_x.trunc() as i32;
+        let int_y = total_y.trunc() as i32;
+        self.cursor_carry_x_px = total_x - f64::from(int_x);
+        self.cursor_carry_y_px = total_y - f64::from(int_y);
+        (int_x, int_y)
     }
 
     fn dispatch_two(&mut self, active: &[Contact], now: Timestamp) {
@@ -1105,8 +1225,8 @@ mod tests {
     }
 
     impl Output for &Recorder {
-        fn move_cursor_by(&self, dx: f64, dy: f64) {
-            self.log.borrow_mut().push(format!("move {dx:.4} {dy:.4}"));
+        fn move_cursor_by(&self, dx_px: i32, dy_px: i32) {
+            self.log.borrow_mut().push(format!("move {dx_px} {dy_px}"));
         }
         fn click(&self, button: MouseButton) {
             self.log.borrow_mut().push(format!("click {button:?}"));
@@ -1161,6 +1281,16 @@ mod tests {
     /// (~0.25 mm normal motion vs. 2.5 mm lift jump).
     const TEST_PAD_MM: f64 = 50.0;
 
+    /// Cursor-accel config used by every test that doesn't specifically
+    /// exercise the curve. `exponent == 1.0` makes the gain plain
+    /// linear so `mm * px_per_mm_at_ref` is the pixel delta — and at
+    /// 1.0 px/mm the recorded `move dx dy` numbers match the input
+    /// mm 1:1 (modulo the integer truncation + carry), keeping the
+    /// existing assertions readable.
+    fn test_accel() -> CursorAccel {
+        CursorAccel { px_per_mm_at_ref: 1.0, exponent: 1.0, ref_mm_per_sec: 80.0 }
+    }
+
     fn frame(contacts: &[(u8, f64, f64)]) -> Frame {
         Frame {
             contacts: contacts
@@ -1192,7 +1322,7 @@ mod tests {
         // release — and nothing in between, regardless of how many
         // identical-button frames stream through.
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         s.on_frame(frame_with_button(&[(1, 0.5, 0.5)], true));
         s.on_frame(frame_with_button(&[(1, 0.6, 0.5)], true));
         s.on_frame(frame_with_button(&[(1, 0.7, 0.5)], false));
@@ -1218,7 +1348,7 @@ mod tests {
         // on the pad. Companion must forward the edge — apps need the
         // mouse-down before any drag motion arrives.
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         s.on_frame(frame_with_button(&[], true));
         s.on_frame(frame_with_button(&[], false));
         let log = r.pop();
@@ -1235,7 +1365,7 @@ mod tests {
     #[test]
     fn one_finger_tap_emits_left_click() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         s.on_frame(frame(&[(1, 0.5, 0.5)]));
         s.on_frame(frame(&[]));
         let log = r.pop();
@@ -1245,7 +1375,7 @@ mod tests {
     #[test]
     fn two_finger_tap_emits_right_click() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         s.on_frame(frame(&[(1, 0.4, 0.5), (2, 0.6, 0.5)]));
         s.on_frame(frame(&[]));
         let log = r.pop();
@@ -1255,7 +1385,7 @@ mod tests {
     #[test]
     fn one_finger_drag_emits_cursor() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         // Cursor motion is deferred by one frame, so a 3-frame sequence
         // is needed for the second frame's motion to surface (the third
         // frame, with a finger still down, drains the buffer). A 2-frame
@@ -1271,7 +1401,7 @@ mod tests {
     #[test]
     fn two_finger_pan_emits_scroll() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         s.on_frame(frame(&[(1, 0.4, 0.5), (2, 0.6, 0.5)]));
         s.on_frame(frame(&[(1, 0.4, 0.55), (2, 0.6, 0.55)]));
         s.on_frame(frame(&[(1, 0.4, 0.6), (2, 0.6, 0.6)]));
@@ -1287,7 +1417,7 @@ mod tests {
     #[test]
     fn two_finger_spread_emits_pinch() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         s.on_frame(frame(&[(1, 0.45, 0.5), (2, 0.55, 0.5)]));
         s.on_frame(frame(&[(1, 0.4, 0.5), (2, 0.6, 0.5)]));
         s.on_frame(frame(&[(1, 0.3, 0.5), (2, 0.7, 0.5)]));
@@ -1308,7 +1438,7 @@ mod tests {
     #[test]
     fn asymmetric_pinch_locks_pinch_not_pan() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         // 50mm test pad. Contact 1 at (10,30), Contact 2 at (40,20) —
         // distance ≈ 31.6 mm. Contact 1 stays anchored; Contact 2
         // moves diagonally toward it. Before the fix, the centroid
@@ -1344,7 +1474,7 @@ mod tests {
     #[test]
     fn asymmetric_pinch_with_minor_motion_on_anchor_finger_locks_pinch() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         // Coordinates chosen to be in mm directly via the 50mm test
         // pad helper. Two contacts ~52mm apart along the diagonal.
         s.on_frame(frame(&[(1, 0.062, 0.826), (2, 0.964, 0.311)]));
@@ -1367,7 +1497,7 @@ mod tests {
     #[test]
     fn two_finger_rotate_emits_rotate() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         s.on_frame(frame(&[(1, 0.4, 0.5), (2, 0.6, 0.5)]));
         // Rotate ~30° around centroid.
         s.on_frame(frame(&[(1, 0.413, 0.45), (2, 0.587, 0.55)]));
@@ -1392,7 +1522,7 @@ mod tests {
     #[test]
     fn pinch_dominant_stream_stays_sticky_under_rotational_noise() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         // c0 and c1 anti-parallel along x; c1 drifts +y by 0.04mm per
         // frame so a tiny angle change accumulates without dominating.
         s.on_frame(frame(&[(1, 0.20, 0.50), (2, 0.80, 0.50)]));
@@ -1430,7 +1560,7 @@ mod tests {
     #[test]
     fn asymmetric_directionally_correlated_motion_does_not_lock_pan() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         // c0 barely moves while c1 sweeps 0.8 mm in similar direction.
         s.on_frame(frame(&[(1, 0.2172, 0.5416), (2, 0.6196, 0.5206)]));
         s.on_frame(frame(&[(1, 0.2196, 0.5412), (2, 0.6240, 0.5162)]));
@@ -1471,7 +1601,7 @@ mod tests {
     #[test]
     fn slow_scroll_with_near_anchored_trailing_finger_locks_pan() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         // mm coordinates / 50, taken from the user's hardware run.
         s.on_frame(frame(&[(1, 0.2704, 0.7574), (2, 0.6292, 0.6898)]));
         s.on_frame(frame(&[(1, 0.2722, 0.7430), (2, 0.6292, 0.6894)]));
@@ -1505,7 +1635,7 @@ mod tests {
     #[test]
     fn slow_scroll_with_horizontal_drift_locks_pan_after_one_frame_defer() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         // mm coordinates / 50: c0 sweeps south while c1 drifts east+south.
         // y-components are aligned (both south); x-components diverge.
         s.on_frame(frame(&[(1, 0.7168, 0.4774), (2, 0.2570, 0.6334)]));
@@ -1539,7 +1669,7 @@ mod tests {
     #[test]
     fn slow_scroll_with_finger_lag_locks_pan() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         // mm coordinates / 50: c0 sweeps ~2.3 mm south while c1 only
         // shifts ~0.3 mm in the same direction.
         s.on_frame(frame(&[(1, 0.7786, 0.3348), (2, 0.4360, 0.4008)]));
@@ -1570,7 +1700,7 @@ mod tests {
     #[test]
     fn mixed_pinch_rotate_emits_both_streams_in_their_dominant_frames() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         // Coordinates lifted from /tmp/rotate.txt:152-174.
         s.on_frame(frame(&[(1, 0.9378, 0.6374), (2, 0.5116, 0.2222)]));
         s.on_frame(frame(&[(1, 0.9378, 0.6368), (2, 0.5116, 0.2222)]));
@@ -1624,7 +1754,7 @@ mod tests {
     #[test]
     fn antiparallel_diagonal_motion_emits_both_pinch_and_rotate() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         // Coordinates pulled from /tmp/rotate.txt:99-109, normalized
         // onto the 50 mm test pad. Real device is 49×65 mm but the
         // test geometry only needs the relative motion to match.
@@ -1662,7 +1792,7 @@ mod tests {
     #[test]
     fn anchored_finger_rotate_with_drift_locks_rotate_not_pan() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         // c0 (id=1) at (15, 20) mm, c1 (id=2) at (15, 40) mm — 20 mm
         // apart vertically. Frames advance c1 along an arc around c0
         // (clockwise on screen, +x with slight -y as it sweeps off the
@@ -1688,7 +1818,7 @@ mod tests {
     #[test]
     fn three_finger_swipe_left_emits_horizontal_negative_progress() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         // Three fingers move 10mm left across 3 frames (50mm pad,
         // 0.1 normalized = 5mm; 0.5 → 0.3 = 10mm). That's well past
         // SWIPE_AXIS_LOCK_MM (3mm) so the gesture locks Horizontal
@@ -1712,7 +1842,7 @@ mod tests {
     #[test]
     fn async_lift_after_swipe_does_not_fire_click() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         s.on_frame(frame(&[(1, 0.4, 0.5), (2, 0.5, 0.5), (3, 0.6, 0.5)]));
         s.on_frame(frame(&[(1, 0.4, 0.3), (2, 0.5, 0.3), (3, 0.6, 0.3)]));
         // Swipe Began should have fired by here — drain the log.
@@ -1761,7 +1891,7 @@ mod tests {
     #[test]
     fn short_stationary_single_finger_tap_fires_left_click() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
         s.on_frame_at(frame(&[(1, 0.5, 0.5)]), t0);
         s.on_frame_at(frame(&[(1, 0.5, 0.5)]), at(t0, 50));
@@ -1774,7 +1904,7 @@ mod tests {
     #[test]
     fn short_stationary_two_finger_tap_fires_right_click() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
         s.on_frame_at(frame(&[(1, 0.4, 0.5), (2, 0.6, 0.5)]), t0);
         s.on_frame_at(frame(&[]), at(t0, 80));
@@ -1788,7 +1918,7 @@ mod tests {
     #[test]
     fn long_touch_does_not_fire_tap() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
         s.on_frame_at(frame(&[(1, 0.5, 0.5)]), t0);
         // Lift well past 220 ms.
@@ -1805,7 +1935,7 @@ mod tests {
     #[test]
     fn motion_laden_touch_does_not_fire_tap() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
         // Move ~2.5 mm along x (0.05 fraction of the 50 mm test pad)
         // — well past TAP_MAX_MOVE_MM = 1.0.
@@ -1831,7 +1961,7 @@ mod tests {
     #[test]
     fn diagonal_short_touch_within_radius_fires_tap() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
         // Series of small diagonal hops; final deviation from start
         // ≈ √(0.007² + 0.006²) × 50 mm ≈ 0.46 mm, well under
@@ -1856,7 +1986,7 @@ mod tests {
     #[test]
     fn scroll_during_touch_does_not_fire_tap() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
         s.on_frame_at(frame(&[(1, 0.40, 0.50), (2, 0.60, 0.50)]), t0);
         s.on_frame_at(frame(&[(1, 0.40, 0.55), (2, 0.60, 0.55)]), at(t0, 16));
@@ -1884,7 +2014,7 @@ mod tests {
     #[ignore = "press-and-hold drag not implemented in gesture.rs"]
     fn software_press_and_hold_latches_button_then_drags_and_releases() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
         // Touch persists past the (yet-to-be-defined) hold threshold,
         // analogous to rmk's HOLD_TIME = 450 ms.
@@ -1926,7 +2056,7 @@ mod tests {
         // Motion past TAP_MAX_MOVE_MM before the hold window — no latch.
         {
             let r = Recorder::default();
-            let mut s = State::new(&r);
+            let mut s = State::new(&r, test_accel());
             let t0 = Timestamp::now();
             s.on_frame_at(frame(&[(1, 0.50, 0.50)]), t0);
             s.on_frame_at(frame(&[(1, 0.55, 0.55)]), at(t0, 30));
@@ -1941,7 +2071,7 @@ mod tests {
         // Two-finger sessions never latch a hold.
         {
             let r = Recorder::default();
-            let mut s = State::new(&r);
+            let mut s = State::new(&r, test_accel());
             let t0 = Timestamp::now();
             s.on_frame_at(frame(&[(1, 0.40, 0.50), (2, 0.60, 0.50)]), t0);
             s.on_frame_at(frame(&[(1, 0.40, 0.50), (2, 0.60, 0.50)]), at(t0, 460));
@@ -1963,7 +2093,7 @@ mod tests {
     #[test]
     fn lift_suppresses_prior_frame_centroid_shift_jump() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
         // Open with motion well past TAP_MAX_MOVE_MM so the could-still-tap
         // gate releases on frame 2 — otherwise no `move` lines emit and
@@ -2009,7 +2139,7 @@ mod tests {
     #[test]
     fn pre_scroll_two_finger_settling_does_not_emit_cursor() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
 
         // Touchdown: 1 finger. Engine enters OneFinger mode; no motion yet.
@@ -2052,7 +2182,7 @@ mod tests {
     #[test]
     fn small_drift_during_tap_does_not_move_cursor() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
         // Recreates the captured trace: ~0.13 mm total drift over 4
         // frames, lift in 70 ms — clearly a tap, but per-frame Δy hovers
@@ -2097,7 +2227,7 @@ mod tests {
     #[test]
     fn slow_pan_drift_below_dead_zone_still_emits() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
         let frame_two_mm = |ay: f64, by: f64| Frame {
             contacts: vec![
@@ -2148,7 +2278,7 @@ mod tests {
     #[test]
     fn scroll_lift_seeds_inertia() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
         // Two-finger pan moving 5 mm/16ms ≈ 312 mm/s — well above any
         // sane seed threshold the Output side might apply.
@@ -2182,7 +2312,7 @@ mod tests {
     #[test]
     fn new_touch_cancels_inertia() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
         // Idle → 1F triggers cancel_inertia.
         s.on_frame_at(frame(&[(1, 0.5, 0.5)]), t0);
@@ -2202,7 +2332,7 @@ mod tests {
     fn one_finger_tap_during_coast_does_not_click() {
         let r = Recorder::default();
         r.set_inertia_active(true);
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
         s.on_frame_at(frame(&[(1, 0.5, 0.5)]), t0);
         s.on_frame_at(frame(&[(1, 0.5, 0.5)]), at(t0, 50));
@@ -2224,7 +2354,7 @@ mod tests {
     fn two_finger_tap_during_coast_does_not_click() {
         let r = Recorder::default();
         r.set_inertia_active(true);
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
         s.on_frame_at(frame(&[(1, 0.4, 0.5), (2, 0.6, 0.5)]), t0);
         s.on_frame_at(frame(&[]), at(t0, 60));
@@ -2243,7 +2373,7 @@ mod tests {
         let r = Recorder::default();
         // Inertia is NOT active for this touch (already decayed).
         r.set_inertia_active(false);
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
         s.on_frame_at(frame(&[(1, 0.5, 0.5)]), t0);
         s.on_frame_at(frame(&[]), at(t0, 80));
@@ -2262,7 +2392,7 @@ mod tests {
     #[test]
     fn async_lift_after_two_finger_pan_does_not_fire_click() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
         let one = |id, x, y, tip| Contact { id, x, y, tip, confidence: true };
         let two = |a: Contact, b: Contact| Frame {
@@ -2319,7 +2449,7 @@ mod tests {
     #[test]
     fn small_drift_during_two_finger_tap_does_not_lock_or_scroll() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
         // Both fingers drift ~0.5 mm in the same direction over four
         // frames — centroid pan ~0.5 mm (above PAN_LOCK_MM = 0.4) but
@@ -2364,7 +2494,7 @@ mod tests {
     #[test]
     fn two_finger_tap_with_split_lift_fires_right_not_left() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
         let one = |id, x, y, tip| Contact { id, x, y, tip, confidence: true };
         let two = |a: Contact, b: Contact| Frame {
@@ -2419,7 +2549,7 @@ mod tests {
     #[test]
     fn two_finger_tap_with_long_residual_fires_nothing() {
         let r = Recorder::default();
-        let mut s = State::new(&r);
+        let mut s = State::new(&r, test_accel());
         let t0 = Timestamp::now();
         let one = |id, x, y, tip| Contact { id, x, y, tip, confidence: true };
         let two = |a: Contact, b: Contact| Frame {
@@ -2451,5 +2581,112 @@ mod tests {
             !log.iter().any(|l| l.starts_with("click")),
             "long residual must fire neither Right nor Left ({log:?})",
         );
+    }
+
+    /// Curve passes through the linear `px_per_mm_at_ref · v` value at
+    /// `v == ref_mm_per_sec` regardless of exponent — that's what
+    /// "anchor velocity" means. If this drifts, the user's tuning
+    /// intuition (`--sensitivity` = pixels/mm at ref) breaks.
+    #[test]
+    fn cursor_curve_anchored_at_reference_velocity() {
+        let cfg = CursorAccel { px_per_mm_at_ref: 25.0, exponent: 1.5, ref_mm_per_sec: 80.0 };
+        let v = 80.0; // == ref
+        let pixels_per_sec = accelerate_cursor(v, cfg);
+        // Linear feel at ref: 25 px/mm × 80 mm/s = 2000 px/s.
+        assert!((pixels_per_sec - 2000.0).abs() < 1e-6, "got {pixels_per_sec}");
+    }
+
+    /// Exponent > 1: slow movements get sub-linear gain (more
+    /// precision), fast movements get super-linear gain (faster
+    /// flicks). Verify monotonicity of the *gain* (px/mm) so a
+    /// regression in the formula direction is caught.
+    #[test]
+    fn cursor_curve_exponent_gt_one_amplifies_at_speed() {
+        let cfg = CursorAccel { px_per_mm_at_ref: 10.0, exponent: 1.4, ref_mm_per_sec: 80.0 };
+        let gain_at = |v: f64| accelerate_cursor(v, cfg) / v;
+        let slow = gain_at(20.0);
+        let anchor = gain_at(80.0);
+        let fast = gain_at(320.0);
+        assert!(slow < anchor, "slow gain {slow} should be < anchor {anchor}");
+        assert!(fast > anchor, "fast gain {fast} should be > anchor {anchor}");
+        // Anchor invariant.
+        assert!((anchor - 10.0).abs() < 1e-6, "got {anchor}");
+    }
+
+    /// Sign is preserved on negative velocities (a common silent-bug
+    /// site for power curves applied to signed values).
+    #[test]
+    fn cursor_curve_preserves_sign() {
+        let cfg = CursorAccel { px_per_mm_at_ref: 25.0, exponent: 1.3, ref_mm_per_sec: 80.0 };
+        let pos = accelerate_cursor(50.0, cfg);
+        let neg = accelerate_cursor(-50.0, cfg);
+        assert!(pos > 0.0 && neg < 0.0, "pos={pos} neg={neg}");
+        assert!((pos + neg).abs() < 1e-9, "magnitudes should match: {pos} vs {neg}");
+    }
+
+    /// Fractional residual must roll over across frames — without it,
+    /// a slow steady drag below 1 px/frame produces no cursor motion
+    /// at all (integer truncation eats the whole delta every frame).
+    /// At 1 px/mm linear, a sustained 0.5-mm/frame stream emits
+    /// roughly half its frames at 1 px each (and the rest at 0). The
+    /// no-carry counterfactual is "every small frame emits 0" — only
+    /// the two large opening frames would produce moves at all.
+    #[test]
+    fn cursor_carry_accumulates_subpixel_motion_across_frames() {
+        let r = Recorder::default();
+        // 1 px/mm linear — keeps the arithmetic readable.
+        let mut s = State::new(&r, test_accel());
+        let t0 = Timestamp::now();
+        // Two opener frames clear the could-still-tap gate; their
+        // motion is 2.5 mm each → emits 2 and 3 px (the 3 includes
+        // the carry from the first opener).
+        s.on_frame_at(frame(&[(1, 0.50, 0.50)]), t0);
+        s.on_frame_at(frame(&[(1, 0.55, 0.50)]), at(t0, 13));
+        s.on_frame_at(frame(&[(1, 0.60, 0.50)]), at(t0, 26));
+        // Then 10 frames of 0.5-mm-per-frame motion (50 mm pad:
+        // 0.01 unit/frame). Each frame is 0.5 mm = 0.5 px.
+        let mut x = 0.60;
+        for i in 0..10 {
+            x += 0.01;
+            s.on_frame_at(frame(&[(1, x, 0.50)]), at(t0, 39 + i * 13));
+        }
+        // One more frame so the last small-motion sample's
+        // pending_motion gets emitted before lift drops it.
+        x += 0.01;
+        s.on_frame_at(frame(&[(1, x, 0.50)]), at(t0, 39 + 10 * 13));
+
+        let log = r.pop();
+        let move_count = log.iter().filter(|l| l.starts_with("move ")).count();
+        // Without carry, only the two opener frames would produce
+        // moves (each 0.5 mm small frame would truncate to 0). With
+        // carry, ~half of the small frames also emit. Be lenient on
+        // the exact count — the precise emit pattern depends on
+        // where the carry resets and which frames the carry happens
+        // to push over the integer boundary — but ≥ 5 emits proves
+        // sub-pixel motion is reaching the output.
+        assert!(
+            move_count >= 5,
+            "expected carry to convert sub-pixel frames into emits; \
+             got {move_count} move lines ({log:?})",
+        );
+    }
+
+    /// Carry must reset on lift so a fresh OneFinger session can't
+    /// inherit a residual pixel from the previous one.
+    #[test]
+    fn cursor_carry_resets_on_lift() {
+        let r = Recorder::default();
+        let mut s = State::new(&r, test_accel());
+        let t0 = Timestamp::now();
+        // Drive enough motion to populate the carry, then lift.
+        s.on_frame_at(frame(&[(1, 0.50, 0.50)]), t0);
+        s.on_frame_at(frame(&[(1, 0.55, 0.50)]), at(t0, 13));
+        s.on_frame_at(frame(&[(1, 0.60, 0.50)]), at(t0, 26));
+        s.on_frame_at(frame(&[(1, 0.605, 0.50)]), at(t0, 39));
+        s.on_frame_at(frame(&[]), at(t0, 52));
+        // After lift, both carries should be exactly zero so the next
+        // session starts clean.
+        assert_eq!(s.cursor_carry_x_px, 0.0);
+        assert_eq!(s.cursor_carry_y_px, 0.0);
     }
 }

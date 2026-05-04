@@ -755,10 +755,6 @@ fn synthesize_gesture_event(
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
-    /// Screen pixels emitted per millimeter of finger motion. Pad-density
-    /// independent, so a given value gives the same physical sensitivity
-    /// across pads of any logical resolution or aspect ratio.
-    pub accel: f64,
     /// Screen pixels emitted per millimeter of finger motion in scroll mode.
     pub scroll_accel: f64,
     /// Natural scrolling: finger-down on the pad scrolls content down on
@@ -827,7 +823,12 @@ pub trait Output {
     /// so test fakes that don't care about timestamps don't have to
     /// implement it.
     fn set_event_time(&self, _ts: Timestamp) {}
-    fn move_cursor_by(&self, dx_mm: f64, dy_mm: f64);
+    /// Post a cursor move with the given pixel deltas. The gesture
+    /// engine has already applied any acceleration curve and rounded
+    /// to integer pixels (carrying the sub-pixel residual across
+    /// frames), so this is a thin wrapper around `CGEventCreateMouseEvent`
+    /// — no scaling here.
+    fn move_cursor_by(&self, dx_px: i32, dy_px: i32);
     fn click(&self, button: MouseButton);
     /// Latch the integrated touchpad button. Driven by the firmware's
     /// PTP report bit (bit 0 = left), which in turn mirrors keymap-driven
@@ -1004,13 +1005,14 @@ impl Emitter {
         unsafe { CGEventGetLocation(e.0) }
     }
 
-    pub fn move_cursor_by(&self, dx_mm: f64, dy_mm: f64) {
-        let dx = dx_mm * self.cfg.accel;
-        let dy = dy_mm * self.cfg.accel;
+    pub fn move_cursor_by(&self, dx_px: i32, dy_px: i32) {
+        if dx_px == 0 && dy_px == 0 {
+            return;
+        }
         let from = self.cursor();
         let mut p = from;
-        p.x += dx;
-        p.y += dy;
+        p.x += f64::from(dx_px);
+        p.y += f64::from(dy_px);
         // If the proposed point lands off every display, clamp it to the
         // bounds of the source display so the *event location* sits exactly
         // on the edge. The auto-hidden full-screen menu bar reveals only
@@ -1043,18 +1045,18 @@ impl Emitter {
             kCGEventMouseMoved
         };
         let Some(e) = Event::from_raw(unsafe {
-            CGEventCreateMouseEvent(std::ptr::null_mut(), event_type, p, kCGMouseButtonLeft)
+            CGEventCreateMouseEvent(self.event_source, event_type, p, kCGMouseButtonLeft)
         }) else {
             return;
         };
-        e.set_int(kCGMouseEventDeltaX as u32, dx as i64);
-        e.set_int(kCGMouseEventDeltaY as u32, dy as i64);
+        e.set_int(kCGMouseEventDeltaX as u32, i64::from(dx_px));
+        e.set_int(kCGMouseEventDeltaY as u32, i64::from(dy_px));
         unsafe { CGEventSetTimestamp(e.0, self.event_timestamp().as_nanos()) };
         log::trace!(
-            "post: {} d=({:+.1},{:+.1})px to=({:.0},{:.0})",
+            "post: {} d=({:+},{:+})px to=({:.0},{:.0})",
             if self.left_button_held.get() { "leftMouseDragged" } else { "mouseMoved" },
-            dx,
-            dy,
+            dx_px,
+            dy_px,
             p.x,
             p.y
         );
@@ -1079,7 +1081,7 @@ impl Emitter {
             p.y,
         );
         if let Some(e) = Event::from_raw(unsafe {
-            CGEventCreateMouseEvent(std::ptr::null_mut(), event_type, p, kCGMouseButtonLeft)
+            CGEventCreateMouseEvent(self.event_source, event_type, p, kCGMouseButtonLeft)
         }) {
             // Click-state 1 matches the firmware-button semantic: a single
             // press, not a synthetic double/triple. Without setting this,
@@ -1136,14 +1138,14 @@ impl Emitter {
         // and the `last_click` cache entry all share one time-base.
         let stamp_ns = now.as_nanos();
         if let Some(e) = Event::from_raw(unsafe {
-            CGEventCreateMouseEvent(std::ptr::null_mut(), down, p, raw_button)
+            CGEventCreateMouseEvent(self.event_source, down, p, raw_button)
         }) {
             e.set_int(kCGMouseEventClickState, count);
             unsafe { CGEventSetTimestamp(e.0, stamp_ns) };
             e.post();
         }
         if let Some(e) = Event::from_raw(unsafe {
-            CGEventCreateMouseEvent(std::ptr::null_mut(), up, p, raw_button)
+            CGEventCreateMouseEvent(self.event_source, up, p, raw_button)
         }) {
             e.set_int(kCGMouseEventClickState, count);
             unsafe { CGEventSetTimestamp(e.0, stamp_ns) };
@@ -1744,8 +1746,8 @@ impl Output for Emitter {
     fn set_event_time(&self, ts: Timestamp) {
         self.event_time.set(Some(ts));
     }
-    fn move_cursor_by(&self, dx_mm: f64, dy_mm: f64) {
-        Emitter::move_cursor_by(self, dx_mm, dy_mm);
+    fn move_cursor_by(&self, dx_px: i32, dy_px: i32) {
+        Emitter::move_cursor_by(self, dx_px, dy_px);
     }
     fn click(&self, button: MouseButton) {
         Emitter::click(self, button);
