@@ -21,7 +21,9 @@ use core_graphics::display::CGDisplay;
 use core_graphics::geometry::{CGPoint, CGRect};
 use std::cell::Cell;
 use std::ffi::c_void;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::time::Timestamp;
 
 /// Hardcoded macOS double-click interval. Configurable in System
 /// Settings (Mouse → Double-Click Speed) but rarely changed; querying
@@ -392,14 +394,7 @@ unsafe extern "C" {
     fn CFDataAppendBytes(data: *mut c_void, bytes: *const u8, length: i64);
     fn CFDataDeleteBytes(data: *mut c_void, range: CFRange);
     fn CFDataGetLength(data: *const c_void) -> i64;
-    fn clock_gettime_nsec_np(clock_id: u32) -> u64;
 }
-
-/// `CLOCK_UPTIME_RAW` from `<time.h>` — monotonic nanoseconds since boot
-/// (does not advance during sleep). Same time base IOHID uses for its
-/// event timestamps, and what `tl_uptime()` in calftrail returns via
-/// the deprecated `AbsoluteToNanoseconds(UpTime())` path.
-const CLOCK_UPTIME_RAW: u32 = 8;
 
 struct Event(CGEventRef);
 
@@ -449,6 +444,7 @@ impl Drop for Event {
         unsafe { CFRelease(self.0 as *const c_void) };
     }
 }
+
 
 // ---------- Calftrail-style gesture synthesizer ----------
 //
@@ -589,8 +585,19 @@ fn append_field_f32(data: *mut c_void, field: u8, value: f32) {
 /// no embedded child touches (Hammerspoon's `newGesture` does the same;
 /// the parent digitizer-hand collection alone is enough for AppKit's
 /// gesture-recognizer pipeline to bind to the event).
-fn synthesize_gesture_event(subtype: u32, phase: u32, payload: GesturePayload) -> Option<Event> {
-    let timestamp = unsafe { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) };
+fn synthesize_gesture_event(
+    subtype: u32,
+    phase: u32,
+    payload: GesturePayload,
+    ts: Timestamp,
+) -> Option<Event> {
+    // `Timestamp` is `CLOCK_UPTIME_RAW`-based, which is the time base
+    // IOHID stamps on real-trackpad events and what `tl_uptime()` in
+    // calftrail returns via the deprecated
+    // `AbsoluteToNanoseconds(UpTime())` path. Stamping the gesture
+    // wrapper, queue element, parent digitizer event, and vendor token
+    // with the same value mirrors what real events look like.
+    let timestamp = ts.as_nanos();
 
     // 1. Base event: type=29 (NSEventTypeGesture) wrapper, magic 256
     //    flags, IOHID-aligned timestamp.
@@ -810,6 +817,16 @@ pub enum SwipeAxis {
 /// against real CGEvents; in tests, swap in a recording fake. All
 /// motion arguments are in physical millimeters of finger travel.
 pub trait Output {
+    /// Called by the gesture engine at the top of each
+    /// [`crate::gesture::State::on_frame_at`] with the host-aligned
+    /// scan timestamp. CGEvent-emitting implementations stamp every
+    /// event posted from subsequent trait calls (until the next
+    /// `set_event_time`) with this value. Out-of-band events not tied
+    /// to a frame — `CFRunLoopTimer`-driven inertia ticks, `Drop`
+    /// cleanup — fall back to `Timestamp::now()`. Default is a no-op
+    /// so test fakes that don't care about timestamps don't have to
+    /// implement it.
+    fn set_event_time(&self, _ts: Timestamp) {}
     fn move_cursor_by(&self, dx_mm: f64, dy_mm: f64);
     fn click(&self, button: MouseButton);
     /// Latch the integrated touchpad button. Driven by the firmware's
@@ -865,7 +882,7 @@ pub struct Emitter {
     /// increment; otherwise reset to 1. macOS doesn't auto-compute the
     /// click count for synthetic events, so triple-click etc. depend
     /// entirely on this field.
-    last_click: Cell<Option<(MouseButton, Instant, CGPoint)>>,
+    last_click: Cell<Option<(MouseButton, Timestamp, CGPoint)>>,
     click_count: Cell<i64>,
     /// Sub-pixel carry for active scroll, by axis. Each `scroll()` call's
     /// f64 pixel value gets accumulated; the integer part drives the
@@ -879,7 +896,7 @@ pub struct Emitter {
     /// per-frame `dt` so the acceleration curve can run on velocity
     /// (mm/s) rather than raw per-frame mm — keeps feel consistent
     /// across pad frame rates.
-    scroll_last_time: Cell<Option<Instant>>,
+    scroll_last_time: Cell<Option<Timestamp>>,
     /// Inertia state plus its CFRunLoopTimer. Boxed for a stable address
     /// — the timer's C context holds a raw pointer back here. Allocated
     /// once at `new()`; the timer ref inside is None except while a
@@ -890,6 +907,13 @@ pub struct Emitter {
     /// gesture, sparing the Dock a stuck rubber-band. None when no
     /// swipe is active.
     swipe_axis: Cell<Option<SwipeAxis>>,
+    /// Host-aligned scan timestamp for the frame currently being
+    /// processed by the gesture engine. Set via `set_event_time` at
+    /// the top of `on_frame_at`; consulted by every per-frame emit
+    /// site for `CGEventSetTimestamp`. None outside a frame — out-of-
+    /// band emits (inertia ticks, Drop cleanup) fall back to
+    /// `Timestamp::now()`.
+    event_time: Cell<Option<Timestamp>>,
     /// True between `LeftMouseDown` and `LeftMouseUp` posts. While set,
     /// `move_cursor_by` emits `LeftMouseDragged` instead of
     /// `MouseMoved` so apps see a real drag stream. Driven by
@@ -914,7 +938,7 @@ struct Momentum {
     vel_y_mm_per_sec: Cell<f64>,
     /// Wall-clock time of the previous tick. Used to derive the per-tick
     /// integration step `dt`; tolerates jitter in timer scheduling.
-    last_tick: Cell<Option<Instant>>,
+    last_tick: Cell<Option<Timestamp>>,
     /// Fractional-pixel carry for momentum-phase events (separate from
     /// the active-scroll carry so a fresh coast doesn't inherit drift
     /// from the lift).
@@ -957,8 +981,18 @@ impl Emitter {
                 began_posted: Cell::new(false),
             }),
             swipe_axis: Cell::new(None),
+            event_time: Cell::new(None),
             left_button_held: Cell::new(false),
         }
+    }
+
+    /// Timestamp to stamp on the next emitted CGEvent. Returns the
+    /// current frame's host-aligned scan time (set via
+    /// [`Output::set_event_time`]) when invoked from within the
+    /// gesture engine's `on_frame_at`; falls back to `Timestamp::now()`
+    /// for out-of-band emits (inertia ticks, Drop cleanup).
+    fn event_timestamp(&self) -> Timestamp {
+        self.event_time.get().unwrap_or_else(Timestamp::now)
     }
 
     pub fn cursor(&self) -> CGPoint {
@@ -1015,6 +1049,7 @@ impl Emitter {
         };
         e.set_int(kCGMouseEventDeltaX as u32, dx as i64);
         e.set_int(kCGMouseEventDeltaY as u32, dy as i64);
+        unsafe { CGEventSetTimestamp(e.0, self.event_timestamp().as_nanos()) };
         log::trace!(
             "post: {} d=({:+.1},{:+.1})px to=({:.0},{:.0})",
             if self.left_button_held.get() { "leftMouseDragged" } else { "mouseMoved" },
@@ -1050,13 +1085,14 @@ impl Emitter {
             // press, not a synthetic double/triple. Without setting this,
             // some apps treat the down/up pair as count=0 and ignore it.
             e.set_int(kCGMouseEventClickState, 1);
+            unsafe { CGEventSetTimestamp(e.0, self.event_timestamp().as_nanos()) };
             e.post();
         }
     }
 
     pub fn click(&self, button: MouseButton) {
         let p = self.cursor();
-        let now = Instant::now();
+        let now = self.event_timestamp();
         // Decide the click count for this event. Same button, within
         // the double-click time and distance windows → increment;
         // otherwise reset to 1. Both the down and up events of this
@@ -1095,16 +1131,22 @@ impl Emitter {
             p.x,
             p.y,
         );
+        // Use the cached `now` from above (which is the frame
+        // timestamp via `event_timestamp`) so the down + up CGEvents
+        // and the `last_click` cache entry all share one time-base.
+        let stamp_ns = now.as_nanos();
         if let Some(e) = Event::from_raw(unsafe {
             CGEventCreateMouseEvent(std::ptr::null_mut(), down, p, raw_button)
         }) {
             e.set_int(kCGMouseEventClickState, count);
+            unsafe { CGEventSetTimestamp(e.0, stamp_ns) };
             e.post();
         }
         if let Some(e) = Event::from_raw(unsafe {
             CGEventCreateMouseEvent(std::ptr::null_mut(), up, p, raw_button)
         }) {
             e.set_int(kCGMouseEventClickState, count);
+            unsafe { CGEventSetTimestamp(e.0, stamp_ns) };
             e.post();
         }
     }
@@ -1116,7 +1158,7 @@ impl Emitter {
     /// acceleration curve runs on a frame-rate-independent velocity.
     pub fn scroll(&self, dx_mm: f64, dy_mm: f64, phase: Phase) {
         let sign = if self.cfg.natural_scroll { 1.0 } else { -1.0 };
-        let now = Instant::now();
+        let now = self.event_timestamp();
         // Reset per-stroke state on Began. Carry would otherwise leak a
         // fraction-of-a-pixel from the previous stroke; `scroll_last_time`
         // would inflate dt across the gap between strokes and corrupt the
@@ -1152,6 +1194,7 @@ impl Emitter {
             dy_px,
             phase,
             /* momentum */ Phase::Cancelled,
+            now,
         );
     }
 
@@ -1183,6 +1226,7 @@ impl Emitter {
             GESTURE_SUBTYPE_MAGNIFY,
             iohid_gesture_phase(phase),
             GesturePayload::Magnification(delta as f32),
+            self.event_timestamp(),
         ) {
             log::trace!("post: pinch {:?} delta={:+.4}", phase, delta);
             e.post_to(kCGSessionEventTap);
@@ -1201,6 +1245,7 @@ impl Emitter {
             GESTURE_SUBTYPE_ROTATE,
             iohid_gesture_phase(phase),
             GesturePayload::Rotation(delta_degrees as f32),
+            self.event_timestamp(),
         ) {
             log::trace!("post: rotate {:?} delta={:+.2}deg", phase, delta_degrees);
             e.post_to(kCGSessionEventTap);
@@ -1303,7 +1348,14 @@ impl Emitter {
             velocity.unwrap_or(0.0),
             phase,
         );
-        post_dock_swipe(self.event_source, motion, dock_phase, origin_offset, velocity);
+        post_dock_swipe(
+            self.event_source,
+            motion,
+            dock_phase,
+            origin_offset,
+            velocity,
+            self.event_timestamp(),
+        );
     }
 
     /// `CoreDockSendNotification` path: discrete commit on lift past a
@@ -1416,6 +1468,7 @@ fn post_dock_swipe(
     phase: i64,
     origin_offset: f64,
     velocity: Option<f64>,
+    ts: Timestamp,
 ) {
     let Some(event) = Event::with_source(source) else { return };
     event.set_int(kCGSEventTypeField, kCGSEventDockControl);
@@ -1432,6 +1485,7 @@ fn post_dock_swipe(
         event.set_dbl(kCGEventGestureSwipeVelocityX, v);
         event.set_dbl(kCGEventGestureSwipeVelocityY, v);
     }
+    unsafe { CGEventSetTimestamp(event.0, ts.as_nanos()) };
     event.post_to(kCGSessionEventTap);
 }
 
@@ -1456,6 +1510,7 @@ fn post_scroll_event(
     float_y_px: f64,
     scroll_phase: Phase,
     momentum_phase: Phase,
+    ts: Timestamp,
 ) {
     let Some(e) = Event::from_raw(unsafe {
         CGEventCreateScrollWheelEvent2(source, kCGScrollEventUnitPixel, 2, int_y_px, int_x_px, 0)
@@ -1479,6 +1534,7 @@ fn post_scroll_event(
     e.set_int(kCGScrollWheelEventFixedPtDeltaAxis2, fp_x);
     e.set_int(kCGScrollWheelEventPointDeltaAxis1, int_y_px as i64);
     e.set_int(kCGScrollWheelEventPointDeltaAxis2, int_x_px as i64);
+    unsafe { CGEventSetTimestamp(e.0, ts.as_nanos()) };
     log::trace!(
         "post: scroll s={:?} m={:?} px=({:+},{:+}) precise=({:+.2},{:+.2})",
         scroll_phase,
@@ -1575,6 +1631,7 @@ impl Momentum {
                 0.0,
                 Phase::Cancelled,
                 Phase::Ended,
+                Timestamp::now(),
             );
         }
         log::debug!("scroll: inertia cancelled");
@@ -1586,7 +1643,7 @@ impl Momentum {
     /// non-zero, decay the velocity, and stop if we're below the
     /// stop threshold.
     fn tick(&self) {
-        let now = Instant::now();
+        let now = Timestamp::now();
         let dt = match self.last_tick.replace(Some(now)) {
             Some(prev) => (now - prev).as_secs_f64().clamp(0.001, 0.1),
             None => MOMENTUM_TICK_INTERVAL,
@@ -1632,6 +1689,7 @@ impl Momentum {
             dy_px,
             Phase::Cancelled,
             phase,
+            Timestamp::now(),
         );
     }
 }
@@ -1661,7 +1719,14 @@ impl Drop for Emitter {
                 SwipeAxis::Horizontal => SWIPE_MOTION_HORIZONTAL,
                 SwipeAxis::Vertical => SWIPE_MOTION_VERTICAL,
             };
-            post_dock_swipe(self.event_source, motion, kCGSGesturePhaseCancelled, 0.0, Some(0.0));
+            post_dock_swipe(
+                self.event_source,
+                motion,
+                kCGSGesturePhaseCancelled,
+                0.0,
+                Some(0.0),
+                Timestamp::now(),
+            );
         }
         if !self.event_source.is_null() {
             unsafe { CFRelease(self.event_source as *const c_void) };
@@ -1676,6 +1741,9 @@ pub enum MouseButton {
 }
 
 impl Output for Emitter {
+    fn set_event_time(&self, ts: Timestamp) {
+        self.event_time.set(Some(ts));
+    }
     fn move_cursor_by(&self, dx_mm: f64, dy_mm: f64) {
         Emitter::move_cursor_by(self, dx_mm, dy_mm);
     }

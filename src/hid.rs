@@ -11,6 +11,8 @@
 
 use crate::descriptor::{self, Layout};
 use crate::report::{self, Frame};
+use crate::scan_clock::ScanTimeClock;
+use crate::time::Timestamp;
 use anyhow::{Result, bail};
 use core_foundation::base::{CFType, TCFType};
 use core_foundation::data::CFData;
@@ -130,7 +132,7 @@ pub struct Manager {
 /// callbacks fire on the run-loop thread, so single-threaded `&mut`
 /// access through raw pointers is safe.
 struct Bridge {
-    on_frame: Box<dyn FnMut(Frame)>,
+    on_frame: Box<dyn FnMut(Frame, Timestamp)>,
     devices: Vec<Pin<Box<DeviceState>>>,
 }
 
@@ -139,6 +141,9 @@ struct DeviceState {
     layout: Layout,
     buf: Vec<u8>,
     bridge: *mut Bridge,
+    /// Per-device scan-time → host-time estimator. Each device has its
+    /// own free-running scan_time counter, so each gets its own clock.
+    scan_clock: ScanTimeClock,
 }
 
 impl Drop for DeviceState {
@@ -170,7 +175,7 @@ impl Manager {
     /// SIGINT or the run loop is stopped.
     pub fn run<F>(&mut self, on_frame: F) -> Result<()>
     where
-        F: FnMut(Frame) + 'static,
+        F: FnMut(Frame, Timestamp) + 'static,
     {
         let bridge = Box::pin(Bridge {
             on_frame: Box::new(on_frame),
@@ -353,6 +358,7 @@ unsafe extern "C" fn on_device_matched(
         layout,
         buf: vec![0u8; buf_len],
         bridge: bridge as *mut Bridge,
+        scan_clock: ScanTimeClock::new(),
     });
 
     unsafe {
@@ -478,7 +484,15 @@ unsafe extern "C" fn on_input_report(
             );
         }
     }
-    (bridge.on_frame)(frame);
+    // Map the chip-side scan_time onto the host clock. Per-frame
+    // deltas of `aligned_ts` track the device's scan-time deltas
+    // (modulo MCU↔host clock drift), so any delivery jitter in
+    // `Timestamp::now()` between the chip's scan instant and our
+    // callback doesn't contaminate the dt the gesture engine reads.
+    let aligned_ts = state
+        .scan_clock
+        .observe(frame.scan_time_100us, Timestamp::now());
+    (bridge.on_frame)(frame, aligned_ts);
 }
 
 fn hex(bytes: &[u8]) -> String {

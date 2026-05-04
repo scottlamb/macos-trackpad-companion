@@ -8,8 +8,9 @@
 
 use crate::output::{MouseButton, Output, Phase, SwipeAxis};
 use crate::report::{Contact, Frame};
+use crate::time::Timestamp;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // ---- Tunables ----
 //
@@ -78,7 +79,7 @@ struct Tracked {
     prev_y: f64,
     down_x: f64,
     down_y: f64,
-    down_at: Instant,
+    down_at: Timestamp,
     max_move_sq: f64,
 }
 
@@ -154,7 +155,7 @@ struct TwoFingerBaseline {
     /// Time of the most recent scroll-event emission. Combined with the
     /// new event's timestamp to compute the per-frame dt that turns a
     /// per-frame mm delta into a mm/sec velocity sample.
-    last_scroll_time: Option<Instant>,
+    last_scroll_time: Option<Timestamp>,
     /// Set when a frame's pinch or rotate score crossed lock threshold
     /// but a lenient pan signal (basic `common > differential * 1.2`,
     /// ignoring the per-finger gate) was stronger — likely a slow scroll
@@ -187,7 +188,7 @@ struct MultiBaseline {
     last_centroid: (f64, f64),
     /// Wall-clock time of `last_centroid`. None on the first frame
     /// (no meaningful dt yet).
-    last_centroid_time: Option<Instant>,
+    last_centroid_time: Option<Timestamp>,
     /// EMA-smoothed centroid velocity in mm/s along (X, Y). Carried
     /// to the Ended event as the lift-velocity signal that the Dock
     /// uses to decide commit-vs-rubber-band.
@@ -204,7 +205,7 @@ struct MultiBaseline {
 struct PendingTwoFingerTap {
     /// When the 2F gesture (not the residual 1F) began. Used to decide
     /// whether the right-click is still in the original tap window.
-    started_at: Instant,
+    started_at: Timestamp,
     /// Worst-case per-contact motion observed during the 2F phase.
     /// Combined (via max) with the residual 1F's `max_move_sq` to
     /// decide whether to fire the right-click.
@@ -215,7 +216,7 @@ pub struct State<O: Output> {
     out: O,
     contacts: HashMap<u8, Tracked>,
     kind: GestureKind,
-    started_at: Instant,
+    started_at: Timestamp,
     /// Worst-case movement of any contact since the gesture started.
     max_move_sq: f64,
     two_baseline: Option<TwoFingerBaseline>,
@@ -260,7 +261,7 @@ pub struct State<O: Output> {
 
 impl<O: Output> State<O> {
     pub fn new(out: O) -> Self {
-        let now = Instant::now();
+        let now = Timestamp::now();
         Self {
             out,
             contacts: HashMap::new(),
@@ -277,14 +278,29 @@ impl<O: Output> State<O> {
         }
     }
 
+    /// Convenience wrapper that stamps the frame with the current
+    /// host time. Used only by tests where timing isn't load-bearing
+    /// (e.g. integrated-button edge cases). Production goes through
+    /// [`Self::on_frame_at`] directly with a scan-time-derived
+    /// timestamp from [`crate::scan_clock::ScanTimeClock`].
+    #[cfg(test)]
     pub fn on_frame(&mut self, frame: Frame) {
-        self.on_frame_at(frame, Instant::now());
+        self.on_frame_at(frame, Timestamp::now());
     }
 
-    /// Like [`Self::on_frame`] but with an injected timestamp. Production
-    /// uses `on_frame`; tests use this so tap/hold thresholds can be
-    /// exercised deterministically without sleeping.
-    pub fn on_frame_at(&mut self, frame: Frame, now: Instant) {
+    /// Process one decoded touchpad frame at host time `now`. The HID
+    /// layer (`hid::on_input_report`) computes `now` via
+    /// [`crate::scan_clock::ScanTimeClock`], which converts the chip's
+    /// `scan_time_100us` into a host-aligned `Timestamp` whose per-frame
+    /// deltas reflect the chip's scan cadence rather than report
+    /// delivery cadence. Tests inject their own `now` directly.
+    pub fn on_frame_at(&mut self, frame: Frame, now: Timestamp) {
+        // Hand the frame timestamp to the output so per-frame CGEvents
+        // (cursor moves, button down/up, scrolls, etc.) get stamped
+        // with the host-aligned scan time rather than wall-clock now,
+        // matching the time base the gesture engine itself runs on.
+        self.out.set_event_time(now);
+
         // Forward integrated-button edges before the contact-driven
         // gesture pipeline runs, so a press that arrives in the same
         // frame as a finger movement turns into a real drag (the
@@ -378,7 +394,7 @@ impl<O: Output> State<O> {
         &mut self,
         new_kind: GestureKind,
         active: &[Contact],
-        now: Instant,
+        now: Timestamp,
     ) {
         // First contact after Idle cancels any in-flight scroll inertia.
         // `SwipeLatched → Idle → ...` doesn't count: a deliberate new
@@ -652,7 +668,7 @@ impl<O: Output> State<O> {
         }
     }
 
-    fn dispatch(&mut self, active: &[Contact], now: Instant) {
+    fn dispatch(&mut self, active: &[Contact], now: Timestamp) {
         match self.kind {
             GestureKind::Idle | GestureKind::SwipeLatched => {}
             GestureKind::OneFinger => self.dispatch_one(active, now),
@@ -663,7 +679,7 @@ impl<O: Output> State<O> {
         }
     }
 
-    fn dispatch_one(&mut self, active: &[Contact], now: Instant) {
+    fn dispatch_one(&mut self, active: &[Contact], now: Timestamp) {
         let c = active[0];
         let Some(tr) = self.contacts.get(&c.id) else {
             return;
@@ -706,7 +722,7 @@ impl<O: Output> State<O> {
         self.pending_motion = Some((dx, dy));
     }
 
-    fn dispatch_two(&mut self, active: &[Contact], now: Instant) {
+    fn dispatch_two(&mut self, active: &[Contact], now: Timestamp) {
         if active.len() != 2 {
             return;
         }
@@ -991,7 +1007,7 @@ impl<O: Output> State<O> {
         self.two_baseline = Some(base);
     }
 
-    fn dispatch_swipe(&mut self, active: &[Contact], now: Instant) {
+    fn dispatch_swipe(&mut self, active: &[Contact], now: Timestamp) {
         let Some(mut base) = self.multi_baseline else {
             return;
         };
@@ -1736,7 +1752,7 @@ mod tests {
     // `TAP_MAX_MOVE_MM = 1.0`. Slight conservatism here, since macOS
     // users expect taps to be forgiving of minor finger drift.
 
-    fn at(t0: Instant, ms: u64) -> Instant {
+    fn at(t0: Timestamp, ms: u64) -> Timestamp {
         t0 + Duration::from_millis(ms)
     }
 
@@ -1746,7 +1762,7 @@ mod tests {
     fn short_stationary_single_finger_tap_fires_left_click() {
         let r = Recorder::default();
         let mut s = State::new(&r);
-        let t0 = Instant::now();
+        let t0 = Timestamp::now();
         s.on_frame_at(frame(&[(1, 0.5, 0.5)]), t0);
         s.on_frame_at(frame(&[(1, 0.5, 0.5)]), at(t0, 50));
         s.on_frame_at(frame(&[]), at(t0, 100));
@@ -1759,7 +1775,7 @@ mod tests {
     fn short_stationary_two_finger_tap_fires_right_click() {
         let r = Recorder::default();
         let mut s = State::new(&r);
-        let t0 = Instant::now();
+        let t0 = Timestamp::now();
         s.on_frame_at(frame(&[(1, 0.4, 0.5), (2, 0.6, 0.5)]), t0);
         s.on_frame_at(frame(&[]), at(t0, 80));
         let log = r.pop();
@@ -1773,7 +1789,7 @@ mod tests {
     fn long_touch_does_not_fire_tap() {
         let r = Recorder::default();
         let mut s = State::new(&r);
-        let t0 = Instant::now();
+        let t0 = Timestamp::now();
         s.on_frame_at(frame(&[(1, 0.5, 0.5)]), t0);
         // Lift well past 220 ms.
         s.on_frame_at(frame(&[]), at(t0, 400));
@@ -1790,7 +1806,7 @@ mod tests {
     fn motion_laden_touch_does_not_fire_tap() {
         let r = Recorder::default();
         let mut s = State::new(&r);
-        let t0 = Instant::now();
+        let t0 = Timestamp::now();
         // Move ~2.5 mm along x (0.05 fraction of the 50 mm test pad)
         // — well past TAP_MAX_MOVE_MM = 1.0.
         s.on_frame_at(frame(&[(1, 0.50, 0.50)]), t0);
@@ -1816,7 +1832,7 @@ mod tests {
     fn diagonal_short_touch_within_radius_fires_tap() {
         let r = Recorder::default();
         let mut s = State::new(&r);
-        let t0 = Instant::now();
+        let t0 = Timestamp::now();
         // Series of small diagonal hops; final deviation from start
         // ≈ √(0.007² + 0.006²) × 50 mm ≈ 0.46 mm, well under
         // TAP_MAX_MOVE_MM = 1.0.
@@ -1841,7 +1857,7 @@ mod tests {
     fn scroll_during_touch_does_not_fire_tap() {
         let r = Recorder::default();
         let mut s = State::new(&r);
-        let t0 = Instant::now();
+        let t0 = Timestamp::now();
         s.on_frame_at(frame(&[(1, 0.40, 0.50), (2, 0.60, 0.50)]), t0);
         s.on_frame_at(frame(&[(1, 0.40, 0.55), (2, 0.60, 0.55)]), at(t0, 16));
         s.on_frame_at(frame(&[(1, 0.40, 0.60), (2, 0.60, 0.60)]), at(t0, 32));
@@ -1869,7 +1885,7 @@ mod tests {
     fn software_press_and_hold_latches_button_then_drags_and_releases() {
         let r = Recorder::default();
         let mut s = State::new(&r);
-        let t0 = Instant::now();
+        let t0 = Timestamp::now();
         // Touch persists past the (yet-to-be-defined) hold threshold,
         // analogous to rmk's HOLD_TIME = 450 ms.
         s.on_frame_at(frame(&[(1, 0.50, 0.50)]), t0);
@@ -1911,7 +1927,7 @@ mod tests {
         {
             let r = Recorder::default();
             let mut s = State::new(&r);
-            let t0 = Instant::now();
+            let t0 = Timestamp::now();
             s.on_frame_at(frame(&[(1, 0.50, 0.50)]), t0);
             s.on_frame_at(frame(&[(1, 0.55, 0.55)]), at(t0, 30));
             s.on_frame_at(frame(&[(1, 0.55, 0.55)]), at(t0, 460));
@@ -1926,7 +1942,7 @@ mod tests {
         {
             let r = Recorder::default();
             let mut s = State::new(&r);
-            let t0 = Instant::now();
+            let t0 = Timestamp::now();
             s.on_frame_at(frame(&[(1, 0.40, 0.50), (2, 0.60, 0.50)]), t0);
             s.on_frame_at(frame(&[(1, 0.40, 0.50), (2, 0.60, 0.50)]), at(t0, 460));
             let log = r.pop();
@@ -1948,7 +1964,7 @@ mod tests {
     fn lift_suppresses_prior_frame_centroid_shift_jump() {
         let r = Recorder::default();
         let mut s = State::new(&r);
-        let t0 = Instant::now();
+        let t0 = Timestamp::now();
         // Open with motion well past TAP_MAX_MOVE_MM so the could-still-tap
         // gate releases on frame 2 — otherwise no `move` lines emit and
         // the assertion has nothing to check. Then steady 2.5 mm/frame of
@@ -1994,7 +2010,7 @@ mod tests {
     fn pre_scroll_two_finger_settling_does_not_emit_cursor() {
         let r = Recorder::default();
         let mut s = State::new(&r);
-        let t0 = Instant::now();
+        let t0 = Timestamp::now();
 
         // Touchdown: 1 finger. Engine enters OneFinger mode; no motion yet.
         s.on_frame_at(frame(&[(1, 0.323, 0.535)]), t0);
@@ -2037,7 +2053,7 @@ mod tests {
     fn small_drift_during_tap_does_not_move_cursor() {
         let r = Recorder::default();
         let mut s = State::new(&r);
-        let t0 = Instant::now();
+        let t0 = Timestamp::now();
         // Recreates the captured trace: ~0.13 mm total drift over 4
         // frames, lift in 70 ms — clearly a tap, but per-frame Δy hovers
         // at the dead-zone boundary. Note the helper is fed mm
@@ -2082,7 +2098,7 @@ mod tests {
     fn slow_pan_drift_below_dead_zone_still_emits() {
         let r = Recorder::default();
         let mut s = State::new(&r);
-        let t0 = Instant::now();
+        let t0 = Timestamp::now();
         let frame_two_mm = |ay: f64, by: f64| Frame {
             contacts: vec![
                 Contact { id: 1, x: 20.0, y: ay, tip: true, confidence: true },
@@ -2133,7 +2149,7 @@ mod tests {
     fn scroll_lift_seeds_inertia() {
         let r = Recorder::default();
         let mut s = State::new(&r);
-        let t0 = Instant::now();
+        let t0 = Timestamp::now();
         // Two-finger pan moving 5 mm/16ms ≈ 312 mm/s — well above any
         // sane seed threshold the Output side might apply.
         s.on_frame_at(frame(&[(1, 0.4, 0.5), (2, 0.6, 0.5)]), t0);
@@ -2167,7 +2183,7 @@ mod tests {
     fn new_touch_cancels_inertia() {
         let r = Recorder::default();
         let mut s = State::new(&r);
-        let t0 = Instant::now();
+        let t0 = Timestamp::now();
         // Idle → 1F triggers cancel_inertia.
         s.on_frame_at(frame(&[(1, 0.5, 0.5)]), t0);
         let log = r.pop();
@@ -2187,7 +2203,7 @@ mod tests {
         let r = Recorder::default();
         r.set_inertia_active(true);
         let mut s = State::new(&r);
-        let t0 = Instant::now();
+        let t0 = Timestamp::now();
         s.on_frame_at(frame(&[(1, 0.5, 0.5)]), t0);
         s.on_frame_at(frame(&[(1, 0.5, 0.5)]), at(t0, 50));
         s.on_frame_at(frame(&[]), at(t0, 80));
@@ -2209,7 +2225,7 @@ mod tests {
         let r = Recorder::default();
         r.set_inertia_active(true);
         let mut s = State::new(&r);
-        let t0 = Instant::now();
+        let t0 = Timestamp::now();
         s.on_frame_at(frame(&[(1, 0.4, 0.5), (2, 0.6, 0.5)]), t0);
         s.on_frame_at(frame(&[]), at(t0, 60));
         let log = r.pop();
@@ -2228,7 +2244,7 @@ mod tests {
         // Inertia is NOT active for this touch (already decayed).
         r.set_inertia_active(false);
         let mut s = State::new(&r);
-        let t0 = Instant::now();
+        let t0 = Timestamp::now();
         s.on_frame_at(frame(&[(1, 0.5, 0.5)]), t0);
         s.on_frame_at(frame(&[]), at(t0, 80));
         let log = r.pop();
@@ -2247,7 +2263,7 @@ mod tests {
     fn async_lift_after_two_finger_pan_does_not_fire_click() {
         let r = Recorder::default();
         let mut s = State::new(&r);
-        let t0 = Instant::now();
+        let t0 = Timestamp::now();
         let one = |id, x, y, tip| Contact { id, x, y, tip, confidence: true };
         let two = |a: Contact, b: Contact| Frame {
             contacts: vec![a, b],
@@ -2304,7 +2320,7 @@ mod tests {
     fn small_drift_during_two_finger_tap_does_not_lock_or_scroll() {
         let r = Recorder::default();
         let mut s = State::new(&r);
-        let t0 = Instant::now();
+        let t0 = Timestamp::now();
         // Both fingers drift ~0.5 mm in the same direction over four
         // frames — centroid pan ~0.5 mm (above PAN_LOCK_MM = 0.4) but
         // each finger's max_move ~0.5 mm (under TAP_MAX_MOVE_MM = 1.0).
@@ -2349,7 +2365,7 @@ mod tests {
     fn two_finger_tap_with_split_lift_fires_right_not_left() {
         let r = Recorder::default();
         let mut s = State::new(&r);
-        let t0 = Instant::now();
+        let t0 = Timestamp::now();
         let one = |id, x, y, tip| Contact { id, x, y, tip, confidence: true };
         let two = |a: Contact, b: Contact| Frame {
             contacts: vec![a, b],
@@ -2404,7 +2420,7 @@ mod tests {
     fn two_finger_tap_with_long_residual_fires_nothing() {
         let r = Recorder::default();
         let mut s = State::new(&r);
-        let t0 = Instant::now();
+        let t0 = Timestamp::now();
         let one = |id, x, y, tip| Contact { id, x, y, tip, confidence: true };
         let two = |a: Contact, b: Contact| Frame {
             contacts: vec![a, b],

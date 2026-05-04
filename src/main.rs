@@ -15,6 +15,8 @@ mod gesture;
 mod hid;
 mod output;
 mod report;
+mod scan_clock;
+mod time;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -115,7 +117,7 @@ fn main() -> Result<()> {
     })
     .context("open IOHIDManager")?;
 
-    manager.run(move |frame| state.on_frame(frame))?;
+    manager.run(move |frame, ts| state.on_frame_at(frame, ts))?;
 
     Ok(())
 }
