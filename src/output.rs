@@ -839,6 +839,11 @@ pub trait Output {
     /// move-while-button-pressed mismatch. Implementations are expected
     /// to dedupe (called once per frame regardless of change) and only
     /// post the corresponding mouse-down/up CGEvents on actual edges.
+    /// Successive press edges within the system double-click window
+    /// should advance the click count so a fast hardware re-press
+    /// delivers a real double/triple-click — both directly via this
+    /// path and chained with [`Self::click`] (a tap followed by a
+    /// quick hardware press counts as one multi-click sequence).
     fn set_left_button_held(&self, held: bool);
     fn scroll(&self, dx_mm: f64, dy_mm: f64, phase: Phase);
     /// Seed scroll inertia from a just-ended pan. `vx_mm_per_sec` and
@@ -884,7 +889,9 @@ pub struct Emitter {
     /// [`DOUBLE_CLICK_INTERVAL`], within [`DOUBLE_CLICK_DISTANCE_PX`] →
     /// increment; otherwise reset to 1. macOS doesn't auto-compute the
     /// click count for synthetic events, so triple-click etc. depend
-    /// entirely on this field.
+    /// entirely on this field. Tap-derived `click()` and hardware-button
+    /// presses share this state, so consecutive presses across the two
+    /// sources count as one multi-click sequence.
     last_click: Cell<Option<(MouseButton, Timestamp, CGPoint)>>,
     click_count: Cell<i64>,
     /// Sub-pixel carry for active scroll, by axis. Each `scroll()` call's
@@ -917,12 +924,16 @@ pub struct Emitter {
     /// band emits (inertia ticks, Drop cleanup) fall back to
     /// `Timestamp::now()`.
     event_time: Cell<Option<Timestamp>>,
-    /// True between `LeftMouseDown` and `LeftMouseUp` posts. While set,
-    /// `move_cursor_by` emits `LeftMouseDragged` instead of
-    /// `MouseMoved` so apps see a real drag stream. Driven by
-    /// [`Output::set_left_button_held`], which the gesture engine
-    /// forwards from the firmware's PTP integrated-button bit.
-    left_button_held: Cell<bool>,
+    /// `Some(count)` between `LeftMouseDown` and `LeftMouseUp` posts,
+    /// `None` otherwise. While `Some`, `move_cursor_by` emits
+    /// `LeftMouseDragged` instead of `MouseMoved` so apps see a real
+    /// drag stream. Driven by [`Output::set_left_button_held`], which
+    /// the gesture engine forwards from the firmware's PTP integrated-
+    /// button bit. The stored count is the `kCGMouseEventClickState`
+    /// assigned at press time and replayed verbatim on release, so an
+    /// intervening tap-derived `click()` (which would mutate
+    /// `click_count`) can't desync the down/up pair.
+    left_button_held: Cell<Option<i64>>,
 }
 
 /// Inertia state. All cells are accessed only from the main run loop
@@ -985,7 +996,7 @@ impl Emitter {
             }),
             swipe_axis: Cell::new(None),
             event_time: Cell::new(None),
-            left_button_held: Cell::new(false),
+            left_button_held: Cell::new(None),
         }
     }
 
@@ -1041,7 +1052,8 @@ impl Emitter {
             p.y =
                 p.y.clamp(bounds.origin.y, bounds.origin.y + bounds.size.height - 1.0);
         }
-        let event_type = if self.left_button_held.get() {
+        let held = self.left_button_held.get().is_some();
+        let event_type = if held {
             kCGEventLeftMouseDragged
         } else {
             kCGEventMouseMoved
@@ -1056,7 +1068,7 @@ impl Emitter {
         unsafe { CGEventSetTimestamp(e.0, self.event_timestamp().as_nanos()) };
         log::trace!(
             "post: {} d=({:+},{:+})px to=({:.0},{:.0})",
-            if self.left_button_held.get() { "leftMouseDragged" } else { "mouseMoved" },
+            if held { "leftMouseDragged" } else { "mouseMoved" },
             dx_px,
             dy_px,
             p.x,
@@ -1066,42 +1078,55 @@ impl Emitter {
     }
 
     pub fn set_left_button_held(&self, held: bool) {
-        if self.left_button_held.get() == held {
+        let was_held = self.left_button_held.get().is_some();
+        if was_held == held {
             return;
         }
-        self.left_button_held.set(held);
         let p = self.cursor();
-        let event_type = if held {
-            kCGEventLeftMouseDown
+        let now = self.event_timestamp();
+        // Press: chain into the same multi-click sequence tap-derived
+        // clicks use (a tap quickly followed by a hardware press counts
+        // as a double-click, etc.) so the hardware button delivers real
+        // double / triple-click semantics. Stash the count in
+        // `left_button_held` so the matching release can stamp the same
+        // value, surviving any tap-derived `click()` that mutates
+        // `click_count` mid-press.
+        //
+        // Release: replay the press's count verbatim — both halves of
+        // one click carry the same count, matching macOS for natural
+        // input.
+        let (event_type, count) = if held {
+            let c = self.record_click(MouseButton::Left, now, p);
+            self.left_button_held.set(Some(c));
+            (kCGEventLeftMouseDown, c)
         } else {
-            kCGEventLeftMouseUp
+            let c = self.left_button_held.replace(None).unwrap_or(1);
+            (kCGEventLeftMouseUp, c)
         };
         log::debug!(
-            "post: leftMouse{} at=({:.0},{:.0})",
+            "post: leftMouse{} count={} at=({:.0},{:.0})",
             if held { "Down" } else { "Up" },
+            count,
             p.x,
             p.y,
         );
         if let Some(e) = Event::from_raw(unsafe {
             CGEventCreateMouseEvent(self.event_source, event_type, p, kCGMouseButtonLeft)
         }) {
-            // Click-state 1 matches the firmware-button semantic: a single
-            // press, not a synthetic double/triple. Without setting this,
-            // some apps treat the down/up pair as count=0 and ignore it.
-            e.set_int(kCGMouseEventClickState, 1);
-            unsafe { CGEventSetTimestamp(e.0, self.event_timestamp().as_nanos()) };
+            e.set_int(kCGMouseEventClickState, count);
+            unsafe { CGEventSetTimestamp(e.0, now.as_nanos()) };
             e.post();
         }
     }
 
-    pub fn click(&self, button: MouseButton) {
-        let p = self.cursor();
-        let now = self.event_timestamp();
-        // Decide the click count for this event. Same button, within
-        // the double-click time and distance windows → increment;
-        // otherwise reset to 1. Both the down and up events of this
-        // click carry the same count, matching what macOS does for
-        // natural input.
+    /// Decide the `kCGMouseEventClickState` for a fresh press of `button`
+    /// at `p` and time `now`, applying the same time/distance windows
+    /// macOS uses for natural input. Updates `last_click` and
+    /// `click_count` as a side effect so the next call sees this press
+    /// as the head of the sequence. Used by both the tap-derived
+    /// `click()` and the hardware-button down path so they share one
+    /// multi-click counter.
+    fn record_click(&self, button: MouseButton, now: Timestamp, p: CGPoint) -> i64 {
         let count = match self.last_click.get() {
             Some((b, t, last_p))
                 if b == button
@@ -1115,6 +1140,13 @@ impl Emitter {
         };
         self.click_count.set(count);
         self.last_click.set(Some((button, now, p)));
+        count
+    }
+
+    pub fn click(&self, button: MouseButton) {
+        let p = self.cursor();
+        let now = self.event_timestamp();
+        let count = self.record_click(button, now, p);
 
         let (down, up, raw_button) = match button {
             MouseButton::Left => (
