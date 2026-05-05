@@ -16,10 +16,14 @@ use crate::time::Timestamp;
 use anyhow::{Result, bail};
 use core_foundation::base::{CFType, TCFType};
 use core_foundation::data::CFData;
+use core_foundation::date::CFDate;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
-use core_foundation::runloop::{CFRunLoop, CFRunLoopRun, CFRunLoopStop, kCFRunLoopDefaultMode};
+use core_foundation::runloop::{
+    CFRunLoop, CFRunLoopRun, CFRunLoopStop, CFRunLoopTimer, kCFRunLoopDefaultMode,
+};
 use core_foundation::string::CFString;
+use core_foundation_sys::runloop::{CFRunLoopTimerContext, CFRunLoopTimerRef};
 use std::ffi::c_void;
 use std::os::raw::c_int;
 use std::pin::Pin;
@@ -36,14 +40,26 @@ const kIOHIDOptionsTypeNone: IOOptionBits = 0;
 const kIOReturnSuccess: IOReturn = 0;
 const kIOHIDReportTypeFeature: IOHIDReportType = 2;
 
-/// Microsoft Precision Touchpad "Input Mode" feature report ID (declared
-/// in the firmware's PTP descriptor at `rmk/src/hid.rs:PTP_REPORT_DESC`).
-/// Writing `[0x03]` here flips the firmware's `TRACKPAD_USE_PTP` atomic
-/// — without this, the firmware never knows to switch from its mouse
-/// path to publishing PTP reports.
-const PTP_INPUT_MODE_REPORT_ID: isize = 0x08;
-const PTP_INPUT_MODE_MULTITOUCH: u8 = 0x03;
-const PTP_INPUT_MODE_MOUSE: u8 = 0x00;
+/// Vendor Feature Report ID for combined Input Mode + heartbeat opt-in.
+/// One byte: low nibble = mode (0 = mouse, 3 = PTP), bit 7 = "I'll
+/// re-assert this every few seconds; revert to mouse if I stop." Single
+/// SET_FEATURE flips both flags atomically on the firmware side, so
+/// there's no observable state where mode is on but the heartbeat
+/// expectation isn't bound (or vice versa) — the firmware uses that to
+/// recover from us getting SIGKILLed without losing PTP for a host that
+/// never opted in (Windows/Linux take the spec 0x08 path, never write
+/// 0x10, never see a heartbeat demand). See
+/// `rmk/rmk/src/hid.rs::TRACKPAD_USE_PTP` and
+/// `run_ptp_input_mode_watchdog`.
+const PTP_CONTROL_REPORT_ID: isize = 0x10;
+const PTP_CONTROL_PTP_HEARTBEAT: u8 = 0x83; // mode=3 + bit7
+const PTP_CONTROL_MOUSE: u8 = 0x00;
+
+/// How often to re-assert `PTP_CONTROL_PTP_HEARTBEAT` so the firmware
+/// doesn't time us out. Sized comfortably under the firmware's 12-s
+/// timeout (`PTP_HEARTBEAT_TIMEOUT_S`); a couple of skipped pulses
+/// (process pause, USB stack hiccup) still leaves headroom.
+const HEARTBEAT_INTERVAL_SECS: f64 = 5.0;
 
 const KEY_VENDOR_ID: &str = "VendorID";
 const KEY_PRODUCT_ID: &str = "ProductID";
@@ -152,8 +168,10 @@ impl Drop for DeviceState {
         // (after the device is gone — the SET will fail, that's fine)
         // and on graceful companion shutdown when `Manager` drops the
         // bridge (device still attached, the SET takes effect and the
-        // user's trackpad keeps working as a plain mouse).
-        set_ptp_input_mode(self.device, PTP_INPUT_MODE_MOUSE);
+        // user's trackpad keeps working as a plain mouse). On SIGKILL
+        // we never get here at all; the firmware's heartbeat watchdog
+        // catches that case independently.
+        set_ptp_control(self.device, PTP_CONTROL_MOUSE);
     }
 }
 
@@ -228,12 +246,55 @@ impl Manager {
         // mouse mode) never runs — the trackpad would stay stuck in PTP
         // mode after the companion exits. Stop the run loop on signal so
         // `CFRunLoopRun` returns and Rust unwinding drops the bridge
-        // normally.
+        // normally. SIGKILL still skips this; the firmware-side heartbeat
+        // watchdog covers that case.
         install_signal_shutdown();
+
+        // Heartbeat ticker: re-assert the PTP-control byte on every
+        // matched device. Held in `_heartbeat_timer` so the
+        // CFRunLoopTimer's CFRetain stays balanced for the duration of
+        // the run loop.
+        let _heartbeat_timer = install_heartbeat_timer(bridge_ptr);
 
         unsafe { CFRunLoopRun() };
 
         Ok(())
+    }
+}
+
+/// Schedule a CFRunLoopTimer on the current run loop that pulses
+/// `PTP_CONTROL_PTP_HEARTBEAT` to every matched device every
+/// `HEARTBEAT_INTERVAL_SECS`. Runs on the same thread as the device
+/// callbacks, so `bridge.devices` access is safely unsynchronized.
+fn install_heartbeat_timer(bridge_ptr: *mut Bridge) -> CFRunLoopTimer {
+    let mut context = CFRunLoopTimerContext {
+        version: 0,
+        info: bridge_ptr as *mut c_void,
+        retain: None,
+        release: None,
+        copyDescription: None,
+    };
+    let now = CFDate::now().abs_time();
+    let timer = CFRunLoopTimer::new(
+        now + HEARTBEAT_INTERVAL_SECS,
+        HEARTBEAT_INTERVAL_SECS,
+        0,
+        0,
+        on_heartbeat_tick,
+        &mut context,
+    );
+    // `kCFRunLoopDefaultMode` is the static common-mode CFString — safe
+    // to read its pointer value and pass through; CFRunLoopAddTimer
+    // copies/retains as needed.
+    let mode = unsafe { kCFRunLoopDefaultMode };
+    CFRunLoop::get_current().add_timer(&timer, mode);
+    timer
+}
+
+extern "C" fn on_heartbeat_tick(_timer: CFRunLoopTimerRef, info: *mut c_void) {
+    let bridge = unsafe { &*(info as *const Bridge) };
+    for state in &bridge.devices {
+        set_ptp_control(state.device, PTP_CONTROL_PTP_HEARTBEAT);
     }
 }
 
@@ -375,41 +436,44 @@ unsafe extern "C" fn on_device_matched(
         );
     }
 
-    // Tell the firmware to enter PTP mode. Without this the firmware's
-    // existing HID-mouse `TrackpadProcessor` keeps publishing on the
-    // standard mouse path and the PTP input reports we're about to read
-    // never get produced. The corresponding `TRACKPAD_USE_PTP` gate is
-    // in `rmk/src/hid.rs`.
-    set_ptp_input_mode(device, PTP_INPUT_MODE_MULTITOUCH);
+    // Tell the firmware to enter PTP mode AND opt in to the heartbeat
+    // protocol in one wire transaction. The 0x83 byte is mode=3 (PTP)
+    // | bit7 (heartbeat-required); the firmware latches both flags from
+    // a single store, so there's no observable state where mode is on
+    // but the watchdog isn't armed. Without this the firmware's mouse
+    // `TrackpadProcessor` keeps publishing and we'd never see PTP
+    // reports. The matching `TRACKPAD_USE_PTP` gate is in
+    // `rmk/src/hid.rs`.
+    set_ptp_control(device, PTP_CONTROL_PTP_HEARTBEAT);
 
     bridge.devices.push(state);
 }
 
-/// Send a 1-byte SET_FEATURE on the PTP Input Mode report. Best-effort:
-/// errors are logged but don't abort the matched-device flow — even if
-/// the SET fails the companion can still observe traffic, just nothing
-/// useful arrives until the firmware enters PTP mode by some other path.
-fn set_ptp_input_mode(device: IOHIDDeviceRef, mode: u8) {
-    let payload = [mode];
+/// Send a 1-byte SET_FEATURE on the vendor PTP control report.
+/// Best-effort: errors are logged but don't abort the matched-device
+/// flow. Used both to enter/exit PTP and as the heartbeat pulse — the
+/// firmware resets its timeout counter on every successful write,
+/// regardless of whether the byte changed.
+fn set_ptp_control(device: IOHIDDeviceRef, byte: u8) {
+    let payload = [byte];
     let rv = unsafe {
         IOHIDDeviceSetReport(
             device,
             kIOHIDReportTypeFeature,
-            PTP_INPUT_MODE_REPORT_ID,
+            PTP_CONTROL_REPORT_ID,
             payload.as_ptr(),
             payload.len() as isize,
         )
     };
     if rv == kIOReturnSuccess {
-        log::info!("PTP input mode set to {:#04x}", mode);
+        log::debug!("PTP control set to {:#04x}", byte);
     } else {
-        // 0xE00002C7 = kIOReturnUnsupported; common when the matched
-        // interface lacks the InputMode feature (i.e. it's a real PTP
-        // device that uses a different report ID or layout). Our own
-        // firmware uses 0x08 by construction.
+        // 0xE00002C7 = kIOReturnUnsupported; expected if the matched
+        // interface is a third-party PTP device that doesn't carry our
+        // vendor 0x10 report. Our own firmware always exposes it.
         log::warn!(
-            "SET_FEATURE InputMode={:#04x} failed: {:#x}",
-            mode,
+            "SET_FEATURE PTP control={:#04x} failed: {:#x}",
+            byte,
             rv as u32
         );
     }

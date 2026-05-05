@@ -1,12 +1,12 @@
 //! Single-instance guard via `flock(2)` on a per-user pidfile.
 //!
 //! Two companions racing the same trackpad is destructive: on graceful
-//! shutdown each writes `set_ptp_input_mode(MOUSE)` back to the
-//! firmware, flipping the device out of PTP mode underneath whichever
-//! instance is still running. The second instance also doesn't reliably
-//! receive input reports (IOKit delivers each report to one consumer),
-//! so even before shutdown it's deadweight that's about to take down
-//! the live one.
+//! shutdown each writes the PTP-control byte back to mouse mode,
+//! flipping the firmware out of PTP underneath whichever instance is
+//! still running. The second instance also doesn't reliably receive
+//! input reports (IOKit delivers each report to one consumer), so even
+//! before shutdown it's deadweight that's about to take down the live
+//! one.
 //!
 //! The lock fd is held for the lifetime of the process; the kernel
 //! releases the flock on exit (clean, panic, or SIGKILL), so there's no
