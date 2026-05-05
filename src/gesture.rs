@@ -51,6 +51,17 @@ const PINCH_LOCK_RATIO: f64 = 0.04;
 /// gesture (a 3° rotate would otherwise wait for pinch to cross before
 /// the lock triggered). 4° matches Apple's PTP engine.
 const ROTATE_LOCK_RAD: f64 = 4.0_f64 * std::f64::consts::PI / 180.0;
+/// Per-finger displacement (mm) below which a contact is considered
+/// essentially anchored. Sits between two real hardware observations:
+/// genuine anchored-pinch traces show the "still" finger at
+/// ≤ 0.27 mm of slow same-direction drift across the lock window
+/// (chip noise + finger settling), while the user's misclassification
+/// logs show trailing fingers at 0.47–0.67 mm of opposite-direction
+/// motion. 0.3 mm separates the two without a false admit on either
+/// side. Used in the pinch/rotate lock-admission gate to distinguish
+/// anchored-rotate from the ambiguous "leader committed, trailer in
+/// noise band" case.
+const ANCHORED_FINGER_FLOOR_MM: f64 = 0.3;
 
 /// Centroid travel needed to lock the swipe axis (horizontal vs
 /// vertical). Below this, the gesture is still ambiguous; we wait
@@ -953,8 +964,43 @@ impl<O: Output> State<O> {
             } else {
                 0.0
             };
-            let pinch = (dist / base.initial_distance - 1.0).abs() / PINCH_LOCK_RATIO;
-            let rot = angle_delta(ang, base.initial_angle).abs() / ROTATE_LOCK_RAD;
+            // Pinch/rotate scoring is hypersensitive to per-finger noise on
+            // a long lever arm: with fingers ~20 mm apart, sub-mm jitter
+            // accumulated over a few hundred ms can drift the inter-finger
+            // angle past ROTATE_LOCK_RAD (4°) without the user actually
+            // rotating. Two patterns produce trustworthy pinch/rot signal:
+            //
+            //   (a) Both fingers committed past tap-jitter
+            //       (min_per_finger >= TAP_MAX_MOVE_MM). Real bimanual
+            //       rotation/pinch.
+            //   (b) One finger essentially anchored (sub-noise floor) and
+            //       the other moving. Anchored-rotate / anchored-pinch.
+            //
+            // In between — one finger committed, the other drifting in the
+            // ~0.3..1.0 mm noise band — the differential's direction is
+            // dominated by the drifting finger's noise, which from contact
+            // data alone is indistinguishable from a real anti-parallel
+            // rotation. Defer the lock until either the trailer commits or
+            // pan locks on coherent centroid motion. Reproduces user's
+            // 2026-05-04 logs:
+            //   * 485 ms quiet hold (max=0.89 mm, min=0.67 mm) → both
+            //     fingers in noise band, defer.
+            //   * 570 ms quiet then leader heads south (max=1.27 mm,
+            //     min=0.47 mm) → leader committed but trailer's 0.47 mm
+            //     of opposite-y noise looks anti-parallel; defer until
+            //     trailer commits.
+            let pinch_rot_admissible = min_per_finger >= TAP_MAX_MOVE_MM
+                || min_per_finger < ANCHORED_FINGER_FLOOR_MM;
+            let pinch = if pinch_rot_admissible {
+                (dist / base.initial_distance - 1.0).abs() / PINCH_LOCK_RATIO
+            } else {
+                0.0
+            };
+            let rot = if pinch_rot_admissible {
+                angle_delta(ang, base.initial_angle).abs() / ROTATE_LOCK_RAD
+            } else {
+                0.0
+            };
             if pan >= 1.0 || pinch >= 1.0 || rot >= 1.0 {
                 // Pan is mutually exclusive with pinch/rotate (matches
                 // macOS PTP behavior: a 2F gesture locks into either
@@ -1688,6 +1734,99 @@ mod tests {
         );
     }
 
+    /// Two fingers placed down and held mostly still for ~485 ms before
+    /// the user starts scrolling. Both fingers stay within the tap-jitter
+    /// floor (max per-finger displacement ≈ 0.89 mm < TAP_MAX_MOVE_MM)
+    /// the whole time, but with the contacts ~18 mm apart, sub-mm jitter
+    /// drifts the inter-finger angle past ROTATE_LOCK_RAD (4°) and would
+    /// otherwise lock pinch+rotate at rot_score=1.00 — preempting the
+    /// user's actual scroll. Reproduces user's hardware log on
+    /// 2026-05-04. The admissibility gate must hold the lock off
+    /// because both fingers are in the 0.3..1.0 mm noise band.
+    #[test]
+    fn long_settle_with_jitter_does_not_lock_pinch_rotate() {
+        let r = Recorder::default();
+        let mut s = State::new(&r, test_accel());
+        let t0 = Timestamp::now();
+        // mm coordinates / 50, sampled from user's hardware log. Real
+        // device pad is 49×65 mm but only relative motion matters.
+        // c0 stays near (1.15, 37.5)mm; c1 wanders within ~1mm of
+        // (19.8, 33.4)mm. Total span is ~485 ms and per-finger
+        // displacement at the would-be lock frame is ~0.67 mm and
+        // ~0.89 mm — both under TAP_MAX_MOVE_MM (1.0).
+        s.on_frame_at(frame(&[(1, 0.0224, 0.7542), (2, 0.3832, 0.6614)]), t0);
+        s.on_frame_at(frame(&[(1, 0.0224, 0.7524), (2, 0.3942, 0.6632)]), at(t0, 35));
+        s.on_frame_at(frame(&[(1, 0.0230, 0.7486), (2, 0.4010, 0.6644)]), at(t0, 85));
+        s.on_frame_at(frame(&[(1, 0.0240, 0.7448), (2, 0.4020, 0.6652)]), at(t0, 135));
+        s.on_frame_at(frame(&[(1, 0.0244, 0.7444), (2, 0.4020, 0.6660)]), at(t0, 185));
+        s.on_frame_at(frame(&[(1, 0.0254, 0.7440), (2, 0.4010, 0.6694)]), at(t0, 235));
+        s.on_frame_at(frame(&[(1, 0.0264, 0.7444), (2, 0.3986, 0.6724)]), at(t0, 290));
+        s.on_frame_at(frame(&[(1, 0.0278, 0.7436), (2, 0.3966, 0.6750)]), at(t0, 345));
+        s.on_frame_at(frame(&[(1, 0.0292, 0.7426), (2, 0.3948, 0.6754)]), at(t0, 395));
+        s.on_frame_at(frame(&[(1, 0.0292, 0.7426), (2, 0.3938, 0.6758)]), at(t0, 485));
+        s.on_frame_at(frame(&[]), at(t0, 500));
+        let log = r.pop();
+        assert!(
+            !log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            "must not lock pinch+rotate from sub-mm jitter on a wide-spread \
+             baseline: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("rotate") && l.contains("Began")),
+            "must not lock pinch+rotate from sub-mm jitter on a wide-spread \
+             baseline: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            "must not lock pan either — common-mag stays well below \
+             PAN_LOCK_MM here: {log:?}"
+        );
+    }
+
+    /// Long-settle case where the leading finger eventually starts
+    /// committing motion (scroll initiation) but the trailing finger
+    /// is still drifting in the chip-noise band. Reproduces user's
+    /// hardware log on 2026-05-04T23:59:38: ~570 ms of holding still,
+    /// then c0 starts moving south (1.27 mm by lock) while c1 has only
+    /// drifted (0.47 mm, opposite-y direction — pure noise). Without
+    /// the dual-region gate, this looks structurally indistinguishable
+    /// from a real anti-parallel rotation (alignment ≈ -0.94, |common| <
+    /// |differential|), and rot_score crosses 1.08 — preempting what
+    /// the user intends as a scroll. Holding the lock until min_per_finger
+    /// crosses TAP_MAX_MOVE_MM lets the trailing finger reveal whether
+    /// it's anchored, drifting opposite (real rotation), or catching up
+    /// (real scroll lag).
+    #[test]
+    fn long_settle_then_leader_only_does_not_lock_pinch_rotate() {
+        let r = Recorder::default();
+        let mut s = State::new(&r, test_accel());
+        let t0 = Timestamp::now();
+        // mm coordinates / 50, sampled from user's hardware log. Real
+        // device pad is 49×65 mm.
+        s.on_frame_at(frame(&[(1, 0.7986, 0.7922), (2, 0.3900, 0.9112)]), t0);
+        s.on_frame_at(frame(&[(1, 0.7986, 0.7922), (2, 0.3914, 0.9078)]), at(t0, 100));
+        s.on_frame_at(frame(&[(1, 0.7986, 0.7926), (2, 0.3924, 0.9040)]), at(t0, 200));
+        s.on_frame_at(frame(&[(1, 0.7976, 0.7930), (2, 0.3934, 0.9006)]), at(t0, 300));
+        s.on_frame_at(frame(&[(1, 0.7972, 0.7934), (2, 0.3938, 0.8992)]), at(t0, 400));
+        s.on_frame_at(frame(&[(1, 0.7972, 0.7944), (2, 0.3938, 0.8992)]), at(t0, 460));
+        // Leader (c0) starts heading south, trailer (c1) still drifting
+        // in the noise band — would-be lock frame at ~570 ms.
+        s.on_frame_at(frame(&[(1, 0.7972, 0.7982), (2, 0.3938, 0.8992)]), at(t0, 530));
+        s.on_frame_at(frame(&[(1, 0.7968, 0.8176), (2, 0.3938, 0.9026)]), at(t0, 569));
+        s.on_frame_at(frame(&[]), at(t0, 600));
+        let log = r.pop();
+        assert!(
+            !log.iter().any(|l| l.starts_with("pinch") && l.contains("Began")),
+            "leader-only motion with trailer in noise band must not lock \
+             pinch+rotate: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("rotate") && l.contains("Began")),
+            "leader-only motion with trailer in noise band must not lock \
+             pinch+rotate: {log:?}"
+        );
+    }
+
     /// Mixed pinch+rotate gesture: pinch dominates the lock frame, but
     /// rotation dominates subsequent frames — both streams must surface
     /// in their dominant frames. Per-frame the locked 2F mode switches
@@ -1743,14 +1882,14 @@ mod tests {
 
     /// Anti-parallel diagonal motion that's mostly rotation around the
     /// centroid but carries ~4% radial spread as a side effect.
-    /// Reproduces the SoflePLUS2 hardware case from /tmp/rotate.txt:99-109
-    /// — c0 went (-0.79, +0.28) mm and c1 went (+0.67, -1.10) mm by
-    /// lock; the angle change reached 4.5° while the distance grew
-    /// 4.1%. Both streams must report Began (the gesture has both
-    /// rotational and radial signal) and Changed deltas with the
-    /// expected signs — distance grew so the first pinch Changed must
-    /// be positive, and the angle decreased so the first rotate Changed
-    /// must be negative.
+    /// Reproduces the SoflePLUS2 hardware case from /tmp/rotate.txt:99-109.
+    /// The original log locked at the fifth frame (c0 had moved 0.84 mm,
+    /// c1 1.29 mm); the new pinch/rot admissibility gate requires
+    /// `min_per_finger >= TAP_MAX_MOVE_MM` (or one finger essentially
+    /// anchored), so we extend the data with one more frame continuing
+    /// the same trend until c0 reaches 1.09 mm. The point of the test
+    /// is the post-lock behavior — both pinch and rotate streams must
+    /// fire Began concurrently — not the exact frame the lock crosses.
     #[test]
     fn antiparallel_diagonal_motion_emits_both_pinch_and_rotate() {
         let r = Recorder::default();
@@ -1763,6 +1902,10 @@ mod tests {
         s.on_frame(frame(&[(1, 0.4374, 0.4706), (2, 0.8752, 0.6186)]));
         s.on_frame(frame(&[(1, 0.4350, 0.4710), (2, 0.8756, 0.6170)]));
         s.on_frame(frame(&[(1, 0.4292, 0.4778), (2, 0.8766, 0.6148)]));
+        // Synthetic continuation of the same trend so the trailing
+        // finger crosses TAP_MAX_MOVE_MM and the admissibility gate
+        // opens.
+        s.on_frame(frame(&[(1, 0.4250, 0.4810), (2, 0.8780, 0.6120)]));
         s.on_frame(frame(&[]));
         let log = r.pop();
         assert!(
