@@ -1,9 +1,10 @@
 //! macOS event synthesis. Public CGEvent APIs handle cursor, click, and
-//! phased smooth scroll. The private path (gated by [`Config::private_gestures`])
-//! injects pinch, rotate, and swipe via undocumented CGEvent type/field
-//! IDs that BetterTouchTool, Karabiner-Elements, and similar tools have
-//! used for years — stable across recent macOS versions but not in any
-//! public Apple header.
+//! phased smooth scroll. The private path (gated per-gesture by
+//! [`Config::pinch_enabled`] / [`Config::rotate_enabled`] / the swipe
+//! backend selectors) injects pinch, rotate, and swipe via undocumented
+//! CGEvent type/field IDs that BetterTouchTool, Karabiner-Elements, and
+//! similar tools have used for years — stable across recent macOS
+//! versions but not in any public Apple header.
 //!
 //! All field IDs and event-type constants used here are reverse-engineered
 //! from NSEvent type values; see the comments next to each declaration.
@@ -762,11 +763,12 @@ pub struct Config {
     /// "wheel" convention where finger-down moves the scrollbar down /
     /// the content up.
     pub natural_scroll: bool,
-    /// Allow private gesture-event injection for pinch and rotate. If
-    /// false, those are no-ops. Doesn't affect swipes — those have their
-    /// own per-axis backend selectors below, including a non-private
-    /// notification fallback.
-    pub private_gestures: bool,
+    /// Emit private CGEvent pinch events. If false, [`Emitter::pinch`]
+    /// is a no-op. Independent of [`Self::rotate_enabled`].
+    pub pinch_enabled: bool,
+    /// Emit private CGEvent rotate events. If false, [`Emitter::rotate`]
+    /// is a no-op. Independent of [`Self::pinch_enabled`].
+    pub rotate_enabled: bool,
     /// Backend for left/right 3F/4F swipes (Spaces / Full-Screen Apps).
     /// `Notification` isn't a meaningful option here (no Dock notification
     /// for "switch space"); it's silently treated as `Off`.
@@ -775,7 +777,7 @@ pub struct Config {
     pub vertical_swipe: SwipeBackend,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SwipeBackend {
     /// Synthesize trackpad DockSwipe events directly. Animates the
     /// rubber-band live; user can reverse or abort mid-gesture.
@@ -1220,8 +1222,8 @@ impl Emitter {
     /// since the last event (e.g. 0.05 = 5% bigger). Phase brackets are
     /// required for apps to track the gesture.
     pub fn pinch(&self, delta: f64, phase: Phase) {
-        if !self.cfg.private_gestures {
-            log::trace!("post: pinch suppressed (private_gestures=false)");
+        if !self.cfg.pinch_enabled {
+            log::trace!("post: pinch suppressed (pinch_enabled=false)");
             return;
         }
         if let Some(e) = synthesize_gesture_event(
@@ -1239,8 +1241,8 @@ impl Emitter {
     /// since the last event, positive = counterclockwise (matching
     /// NSEvent.rotation semantics).
     pub fn rotate(&self, delta_degrees: f64, phase: Phase) {
-        if !self.cfg.private_gestures {
-            log::trace!("post: rotate suppressed (private_gestures=false)");
+        if !self.cfg.rotate_enabled {
+            log::trace!("post: rotate suppressed (rotate_enabled=false)");
             return;
         }
         if let Some(e) = synthesize_gesture_event(

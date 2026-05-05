@@ -1,4 +1,4 @@
-//! magic-trackpad-companion — userspace bridge from a PTP HID device
+//! macos-trackpad-companion — userspace bridge from a PTP HID device
 //! (Windows Precision Touchpad / Microsoft Precision Touchpad) to native
 //! macOS gesture events.
 //!
@@ -9,7 +9,14 @@
 //!
 //! Permissions: needs Input Monitoring (to read raw HID) and Accessibility
 //! (to post CGEvents) the first run; macOS will prompt.
+//!
+//! Configuration: all tuning lives in a TOML file at
+//! `$XDG_CONFIG_HOME/macos-trackpad-companion/config.toml` (default
+//! `~/.config/macos-trackpad-companion/config.toml`). The CLI surface
+//! intentionally only carries `--config PATH` and `-v` — see `config.rs`
+//! / README for the full schema.
 
+mod config;
 mod descriptor;
 mod gesture;
 mod hid;
@@ -20,129 +27,125 @@ mod time;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use output::SwipeBackend;
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
-    /// Match only devices with this USB vendor ID (hex). Default: any PTP device.
-    #[arg(long, value_parser = parse_hex_u16)]
-    vid: Option<u16>,
+    /// Path to TOML config. Default:
+    /// `$XDG_CONFIG_HOME/macos-trackpad-companion/config.toml`
+    /// (or `~/.config/macos-trackpad-companion/config.toml` if
+    /// `XDG_CONFIG_HOME` is unset). Missing file → all defaults.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
 
-    /// Match only devices with this USB product ID (hex). Default: any PTP device.
-    #[arg(long, value_parser = parse_hex_u16)]
-    pid: Option<u16>,
-
-    /// Disable private CGEvent gesture-type injection for pinch and rotate.
-    /// Doesn't affect swipes — those have their own per-axis backend (see
-    /// --swipe-h / --swipe-v), including a non-private notification fallback.
-    #[arg(long)]
-    no_private_gestures: bool,
-
-    /// Backend for left/right (horizontal) 3F/4F swipes — Spaces and
-    /// Full-Screen Apps. `synthetic` posts trackpad DockSwipe events
-    /// for an animated transition; `notification` is silently treated
-    /// as `off` here (no Dock notification for switching Spaces).
-    #[arg(long, value_enum, default_value_t = SwipeBackend::Synthetic)]
-    swipe_h: SwipeBackend,
-
-    /// Backend for up/down (vertical) 3F/4F swipes — Mission Control
-    /// and App Exposé. `synthetic` animates via DockSwipe events;
-    /// `notification` fires the discrete Dock notification on lift past
-    /// a commit threshold (no live animation).
-    #[arg(long, value_enum, default_value_t = SwipeBackend::Synthetic)]
-    swipe_v: SwipeBackend,
-
-    /// Cursor sensitivity: screen pixels per millimeter of finger
-    /// motion at the curve's reference velocity
-    /// (`--cursor-accel-ref`). With the default
-    /// `--cursor-accel-exponent=1.0` (linear), this value applies at
-    /// every speed — ~25 matches the old default's feel on a 65 mm-wide
-    /// pad. Pad-density independent.
-    #[arg(long, default_value_t = 25.0)]
-    sensitivity: f64,
-
-    /// Power-curve exponent for cursor acceleration. `1.0` (default)
-    /// is linear: `--sensitivity` pixels per mm regardless of speed.
-    /// Values `> 1` boost fast movements (cross-screen flicks) and
-    /// slow movements get sub-linear gain (more precision). Try
-    /// `1.3`–`1.5` for a moderate curve. `< 1` would invert that —
-    /// almost never useful for cursor (it's what `accelerate_scroll`
-    /// does for scrolls, where the goal is to tame fast flicks).
-    #[arg(long, default_value_t = 1.0)]
-    cursor_accel_exponent: f64,
-
-    /// Reference velocity (mm/s of finger travel) at which the curve
-    /// reproduces the linear `--sensitivity` feel. Below this → less
-    /// gain than linear; above this → more. Only matters when
-    /// `--cursor-accel-exponent` differs from 1. ~80 mm/s is roughly
-    /// "moving the cursor at conversational speed" on a small pad.
-    #[arg(long, default_value_t = 80.0)]
-    cursor_accel_ref: f64,
-
-    /// Screen pixels per millimeter of finger motion in scroll mode.
-    #[arg(long, default_value_t = 20.0)]
-    scroll_accel: f64,
-
-    /// Use the legacy "wheel" scroll direction (finger-down → content up,
-    /// the way macOS shipped before 10.7). Off by default → finger-down →
-    /// content-down, matching macOS's "Natural" scrolling.
-    #[arg(long)]
-    invert_scroll: bool,
-
-    /// Verbose logging. Repeat for trace-level (-vv).
+    /// Verbose logging (-v debug, -vv trace). Overrides `[log].level`
+    /// from the config file when set.
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
 }
 
-fn parse_hex_u16(s: &str) -> Result<u16, String> {
-    let s = s.trim_start_matches("0x").trim_start_matches("0X");
-    u16::from_str_radix(s, 16).map_err(|e| e.to_string())
-}
-
 fn main() -> Result<()> {
     let args = Args::parse();
+    let (cfg, cfg_path) = config::load(args.config.as_deref())?;
 
-    let level = match args.verbose {
-        0 => "info",
-        1 => "debug",
-        _ => "trace",
+    let level = if args.verbose > 0 {
+        match args.verbose {
+            1 => "debug",
+            _ => "trace",
+        }
+        .to_string()
+    } else {
+        cfg.log.level.clone()
     };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level))
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level.as_str()))
         .format_timestamp_millis()
         .init();
 
-    log::info!(
-        "magic-trackpad-companion starting (vid={:?} pid={:?} private_gestures={} swipe_h={:?} swipe_v={:?})",
-        args.vid,
-        args.pid,
-        !args.no_private_gestures,
-        args.swipe_h,
-        args.swipe_v,
-    );
+    if cfg_path.exists() {
+        log::info!(
+            "macos-trackpad-companion starting (config={})",
+            cfg_path.display()
+        );
+    } else {
+        log::info!(
+            "macos-trackpad-companion starting (no config at {} — using defaults)",
+            cfg_path.display(),
+        );
+    }
+    log::debug!("resolved config: {:#?}", cfg);
 
-    let cfg = output::Config {
-        scroll_accel: args.scroll_accel,
-        natural_scroll: !args.invert_scroll,
-        private_gestures: !args.no_private_gestures,
-        horizontal_swipe: args.swipe_h,
-        vertical_swipe: args.swipe_v,
+    // Frontmost-app filtering isn't wired yet (no NSWorkspace source).
+    // Warn loudly so a user who configured `only` / `except` knows their
+    // gesture is effectively off / on rather than mysteriously inert.
+    warn_app_filter_unwired("pinch", &cfg.gestures.pinch.enable);
+    warn_app_filter_unwired("rotate", &cfg.gestures.rotate.enable);
+    warn_app_filter_unwired("swipe.horizontal", &cfg.gestures.swipe.horizontal.enable);
+    warn_app_filter_unwired("swipe.vertical", &cfg.gestures.swipe.vertical.enable);
+
+    let out_cfg = output::Config {
+        scroll_accel: cfg.scroll.sensitivity,
+        natural_scroll: cfg.scroll.natural,
+        pinch_enabled: enable_to_bool(&cfg.gestures.pinch.enable),
+        rotate_enabled: enable_to_bool(&cfg.gestures.rotate.enable),
+        horizontal_swipe: resolve_swipe(&cfg.gestures.swipe.horizontal),
+        vertical_swipe: resolve_swipe(&cfg.gestures.swipe.vertical),
     };
     let cursor_accel = gesture::CursorAccel {
-        px_per_mm_at_ref: args.sensitivity,
-        exponent: args.cursor_accel_exponent,
-        ref_mm_per_sec: args.cursor_accel_ref,
+        px_per_mm_at_ref: cfg.cursor.sensitivity,
+        exponent: cfg.cursor.accel_exponent,
+        ref_mm_per_sec: cfg.cursor.accel_ref,
     };
-    let emitter = output::Emitter::new(cfg);
+    let emitter = output::Emitter::new(out_cfg);
     let mut state = gesture::State::new(emitter, cursor_accel);
 
     let mut manager = hid::Manager::new(hid::Filter {
-        vid: args.vid,
-        pid: args.pid,
+        vid: cfg.device.vid,
+        pid: cfg.device.pid,
     })
     .context("open IOHIDManager")?;
 
     manager.run(move |frame, ts| state.on_frame_at(frame, ts))?;
 
     Ok(())
+}
+
+/// Collapse a [`config::GestureEnable`] to a single boolean for the
+/// pinch/rotate gates. `Only` (no frontmost source yet) → `false`;
+/// `Except` → `true`. The startup warning lives in
+/// [`warn_app_filter_unwired`].
+fn enable_to_bool(en: &config::GestureEnable) -> bool {
+    match en {
+        config::GestureEnable::On => true,
+        config::GestureEnable::Off => false,
+        config::GestureEnable::Only(_) => false,
+        config::GestureEnable::Except(_) => true,
+    }
+}
+
+fn resolve_swipe(c: &config::SwipeAxisCfg) -> output::SwipeBackend {
+    let backend = match c.backend {
+        config::SwipeBackend::Synthetic => output::SwipeBackend::Synthetic,
+        config::SwipeBackend::Notification => output::SwipeBackend::Notification,
+        config::SwipeBackend::Off => output::SwipeBackend::Off,
+    };
+    if enable_to_bool(&c.enable) {
+        backend
+    } else {
+        output::SwipeBackend::Off
+    }
+}
+
+fn warn_app_filter_unwired(name: &str, en: &config::GestureEnable) {
+    match en {
+        config::GestureEnable::Only(apps) => log::warn!(
+            "[gestures.{name}] enable.only = {:?}: frontmost-app source not wired yet, gesture is OFF",
+            apps,
+        ),
+        config::GestureEnable::Except(apps) => log::warn!(
+            "[gestures.{name}] enable.except = {:?}: frontmost-app source not wired yet, gesture is ON",
+            apps,
+        ),
+        _ => {}
+    }
 }

@@ -21,17 +21,69 @@ cargo build --release
 ./target/release/companion -v
 ```
 
-CLI flags:
+CLI flags (intentionally tiny — everything else lives in the config file):
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--vid HEX` | any | Match only this USB vendor ID. |
-| `--pid HEX` | any | Match only this USB product ID. |
-| `--accel N` | 25 | Screen pixels per millimeter of finger motion (cursor). |
-| `--scroll-accel N` | 20 | Screen pixels per millimeter of finger motion (scroll). |
-| `--invert-scroll` | off | Use the legacy "wheel" scroll direction (off → macOS-style natural scrolling). |
-| `--no-private-gestures` | off | Disable pinch/rotate/swipe injection. |
-| `-v`, `-vv` | info | Increase log level. |
+| `--config PATH` | XDG default | TOML config path. See **Configuration** below. |
+| `-v`, `-vv` | info | Increase log level. Overrides `[log].level` from the file. |
+
+## Configuration
+
+All tuning lives in a TOML file at
+`$XDG_CONFIG_HOME/macos-trackpad-companion/config.toml`, falling back to
+`~/.config/macos-trackpad-companion/config.toml` when `XDG_CONFIG_HOME`
+is unset. A missing file is fine — defaults take over. Unknown keys are
+rejected so typos surface at startup.
+
+```toml
+[device]                    # optional — match a specific USB device
+# vid = 0x1234              #   (omit either field for any PTP digitizer)
+# pid = 0x5678
+
+[log]
+level = "info"              # error | warn | info | debug | trace
+
+[cursor]
+sensitivity   = 25.0        # px per mm of finger motion at accel_ref
+accel_exponent = 1.0        # 1.0 = linear; >1 boosts fast flicks
+accel_ref     = 80.0        # mm/s — velocity at which sensitivity is the linear feel
+
+[scroll]
+sensitivity = 20.0          # px per mm
+natural     = true          # finger-down → content-down (macOS default since 10.7)
+
+# Each gesture has an `enable` key with three forms:
+#   enable = "on"                                  # always
+#   enable = "off"                                 # never
+#   enable = { only   = ["com.apple.Safari"] }     # frontmost-app allowlist
+#   enable = { except = ["com.apple.Terminal"] }   # frontmost-app denylist
+# `only` and `except` are mutually exclusive. Bundle IDs come from
+# NSWorkspace.frontmostApplication. Frontmost is sampled at gesture
+# *start* and held for the duration of the touch, so a mid-gesture app
+# switch can't kill its own gesture.
+
+[gestures.pinch]
+enable = "on"
+
+[gestures.rotate]
+enable = "on"
+
+[gestures.swipe.horizontal]   # left/right 3F/4F → Spaces / Full-Screen Apps
+enable  = "on"
+backend = "synthetic"         # synthetic | notification | off
+                              #   (notification is silently `off` on this axis —
+                              #    no Dock notification exists for switching spaces)
+
+[gestures.swipe.vertical]     # up/down 3F/4F → Mission Control / App Exposé
+enable  = "on"
+backend = "synthetic"
+```
+
+> **Note**: the frontmost-app source (NSWorkspace) isn't yet wired. If
+> you set `enable = { only = [...] }` or `enable = { except = [...] }`,
+> the daemon logs a warning at startup and treats the gesture as **off**
+> (for `only`) or **on** (for `except`) until that source lands.
 
 ## Permissions
 

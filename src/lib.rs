@@ -3,6 +3,7 @@
 //! daemon) and `src/bin/scroll_replay.rs` (the captured-stream
 //! playback tool).
 
+pub mod config;
 pub mod descriptor;
 pub mod gesture;
 pub mod hid;
