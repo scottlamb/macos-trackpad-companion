@@ -20,6 +20,7 @@ mod config;
 mod descriptor;
 mod gesture;
 mod hid;
+mod instance_lock;
 mod output;
 mod report;
 mod scan_clock;
@@ -74,6 +75,11 @@ fn main() -> Result<()> {
         );
     }
     log::debug!("resolved config: {:#?}", cfg);
+
+    // Bound to a non-underscore name so the guard lives until end of
+    // main; closing the fd releases the kernel's flock.
+    let lock = instance_lock::acquire()?;
+    log::debug!("acquired instance lock at {}", lock.path.display());
 
     // Frontmost-app filtering isn't wired yet (no NSWorkspace source).
     // Warn loudly so a user who configured `only` / `except` knows their

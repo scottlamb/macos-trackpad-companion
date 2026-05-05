@@ -7,6 +7,7 @@ pub mod config;
 pub mod descriptor;
 pub mod gesture;
 pub mod hid;
+pub mod instance_lock;
 pub mod output;
 pub mod report;
 pub mod scan_clock;
