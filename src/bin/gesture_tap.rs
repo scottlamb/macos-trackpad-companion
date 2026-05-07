@@ -25,7 +25,7 @@ use core_foundation::runloop::{CFRunLoop, kCFRunLoopCommonModes, kCFRunLoopDefau
 use core_foundation_sys::base::CFRelease;
 use core_foundation_sys::mach_port::CFMachPortCreateRunLoopSource;
 use core_foundation_sys::runloop::CFRunLoopAddSource;
-use magic_trackpad_companion::time::Timestamp;
+use macos_trackpad_companion::time::Timestamp;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 
