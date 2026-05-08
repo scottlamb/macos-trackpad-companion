@@ -1384,14 +1384,11 @@ impl Emitter {
     ///
     /// Input sign convention (gesture-engine): positive `signed_progress`
     /// = finger centroid moved in the +X (right) / +Y (down) direction
-    /// from the gesture's start. The Dock's wire convention for
-    /// horizontal is the opposite — positive progress on the captured
-    /// MBP shape corresponds to swipe-LEFT finger motion (switching to
-    /// the space on the right under natural scrolling) — so this
-    /// function negates the horizontal sign before sending. Vertical is
-    /// not flipped: the < 0 branch routes Mission Control (fingers up,
-    /// which is -Y in our coordinates) and the >= 0 branch routes App
-    /// Exposé.
+    /// from the gesture's start. The Dock's wire convention is the
+    /// opposite on both axes — measured at the keyboard, fingers-right
+    /// matches a negative horizontal `origin_offset` and fingers-up
+    /// (Mission Control) matches a positive vertical `origin_offset` —
+    /// so this function negates both before sending.
     pub fn swipe(&self, axis: SwipeAxis, signed_progress: f64, velocity_mm_per_sec: f64, phase: Phase) {
         let backend = match axis {
             SwipeAxis::Horizontal => self.cfg.horizontal_swipe,
@@ -1419,20 +1416,10 @@ impl Emitter {
     fn swipe_synthetic(&self, axis: SwipeAxis, signed_progress: f64, velocity_mm_per_sec: f64, phase: Phase) {
         // Gesture-engine convention: positive `signed_progress` = finger
         // centroid moved +X (right) / +Y (down) since gesture start.
-        //
-        // Empirical findings (against the Dock's wire convention,
-        // verified at the keyboard):
-        // - horizontal: positive Dock progress = swipe-LEFT finger motion
-        //   (= switching to the *right* Space under natural scrolling).
-        //   Negate.
-        // - vertical: negative progress = fingers up = Mission Control;
-        //   not flipped.
-        //
-        // Flip either branch if a swipe goes the wrong direction.
-        let origin_offset = match axis {
-            SwipeAxis::Horizontal => -signed_progress,
-            SwipeAxis::Vertical => signed_progress,
-        };
+        // Dock's wire convention is the opposite on both axes (measured
+        // at the keyboard); negate to match. Flip a branch if a swipe
+        // goes the wrong direction.
+        let origin_offset = -signed_progress;
         let motion = match axis {
             SwipeAxis::Horizontal => SWIPE_MOTION_HORIZONTAL,
             SwipeAxis::Vertical => SWIPE_MOTION_VERTICAL,
