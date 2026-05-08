@@ -194,17 +194,21 @@ pub enum SwipeBackend {
 }
 
 /// Per-gesture enable policy. Polymorphic in TOML so the common case
-/// stays terse and the frontmost-app filter lives in one key:
+/// stays terse and the under-cursor filter lives in one key:
 ///
 /// ```toml
-/// enable = "on"                              # always
-/// enable = "off"                             # never
-/// enable = { only   = ["com.apple.Safari"] } # frontmost-app allowlist
-/// enable = { except = ["com.apple.Terminal"] } # frontmost-app denylist
+/// enable = "on"                                # always
+/// enable = "off"                               # never
+/// enable = { only   = ["com.apple.Safari"] }   # allowlist by under-cursor app
+/// enable = { except = ["com.apple.Terminal"] } # denylist by under-cursor app
 /// ```
 ///
-/// Frontmost is sampled at gesture start and held for the duration of
-/// the touch, so a mid-gesture app switch can't kill its own gesture.
+/// Matched against the bundle ID of the application owning the topmost
+/// normal window under the cursor at gesture start; that decision is
+/// held for the duration of the touch so a mid-gesture window switch
+/// can't kill its own gesture. Mirrors how macOS itself dispatches
+/// pinch/rotate/scroll/click — to the window under the cursor, not
+/// strictly the frontmost app.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GestureEnable {
     On,

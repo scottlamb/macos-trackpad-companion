@@ -58,10 +58,21 @@ natural     = true          # finger-down → content-down (macOS default since 
 #   enable = "off"                                 # never
 #   enable = { only   = ["com.apple.Safari"] }     # frontmost-app allowlist
 #   enable = { except = ["com.apple.Terminal"] }   # frontmost-app denylist
-# `only` and `except` are mutually exclusive. Bundle IDs come from
-# NSWorkspace.frontmostApplication. Frontmost is sampled at gesture
-# *start* and held for the duration of the touch, so a mid-gesture app
-# switch can't kill its own gesture.
+# `only` and `except` are mutually exclusive. Bundle IDs are matched
+# against the app owning the topmost normal window under the cursor,
+# sampled at gesture *start* and held for the rest of the touch (so a
+# mid-gesture window switch can't kill its own gesture). Under-cursor
+# rather than frontmost because that's how macOS itself routes
+# pinch/rotate/scroll/click — Mission Control / Spaces 3F/4F swipes
+# are system-wide and ignore window targeting, but the same filter
+# still expresses "don't fire this gesture when my cursor is parked
+# over Terminal."
+#
+# To learn the bundle ID for an app, any of these work:
+#   osascript -e 'id of app "Safari"'                       # by user-facing name
+#   mdls -name kMDItemCFBundleIdentifier -r /Applications/Safari.app
+#   lsappinfo info -only bundleid -app Safari               # currently running
+#   lsappinfo info -only bundleid `lsappinfo front`         # whatever is frontmost now
 
 [gestures.pinch]
 enable = "on"
@@ -79,11 +90,6 @@ backend = "synthetic"         # synthetic | notification | off
 enable  = "on"
 backend = "synthetic"
 ```
-
-> **Note**: the frontmost-app source (NSWorkspace) isn't yet wired. If
-> you set `enable = { only = [...] }` or `enable = { except = [...] }`,
-> the daemon logs a warning at startup and treats the gesture as **off**
-> (for `only`) or **on** (for `except`) until that source lands.
 
 ## Permissions
 

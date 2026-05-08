@@ -16,6 +16,7 @@
 //! intentionally only carries `--config PATH` and `-v` — see `config.rs`
 //! / README for the full schema.
 
+mod app_context;
 mod config;
 mod descriptor;
 mod gesture;
@@ -82,19 +83,11 @@ fn main() -> Result<()> {
     let lock = instance_lock::acquire()?;
     log::debug!("acquired instance lock at {}", lock.path.display());
 
-    // Frontmost-app filtering isn't wired yet (no NSWorkspace source).
-    // Warn loudly so a user who configured `only` / `except` knows their
-    // gesture is effectively off / on rather than mysteriously inert.
-    warn_app_filter_unwired("pinch", &cfg.gestures.pinch.enable);
-    warn_app_filter_unwired("rotate", &cfg.gestures.rotate.enable);
-    warn_app_filter_unwired("swipe.horizontal", &cfg.gestures.swipe.horizontal.enable);
-    warn_app_filter_unwired("swipe.vertical", &cfg.gestures.swipe.vertical.enable);
-
     let out_cfg = output::Config {
         scroll_accel: cfg.scroll.sensitivity,
         natural_scroll: cfg.scroll.natural,
-        pinch_enabled: enable_to_bool(&cfg.gestures.pinch.enable),
-        rotate_enabled: enable_to_bool(&cfg.gestures.rotate.enable),
+        pinch: enable_to_policy(&cfg.gestures.pinch.enable),
+        rotate: enable_to_policy(&cfg.gestures.rotate.enable),
         horizontal_swipe: resolve_swipe(&cfg.gestures.swipe.horizontal),
         vertical_swipe: resolve_swipe(&cfg.gestures.swipe.vertical),
     };
@@ -123,42 +116,26 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Collapse a [`config::GestureEnable`] to a single boolean for the
-/// pinch/rotate gates. `Only` (no frontmost source yet) → `false`;
-/// `Except` → `true`. The startup warning lives in
-/// [`warn_app_filter_unwired`].
-fn enable_to_bool(en: &config::GestureEnable) -> bool {
+/// Translate a [`config::GestureEnable`] (TOML-shaped) into the
+/// [`output::GesturePolicy`] the emitter consumes. Cheap clone — the
+/// app lists are small and only constructed once at startup.
+fn enable_to_policy(en: &config::GestureEnable) -> output::GesturePolicy {
     match en {
-        config::GestureEnable::On => true,
-        config::GestureEnable::Off => false,
-        config::GestureEnable::Only(_) => false,
-        config::GestureEnable::Except(_) => true,
+        config::GestureEnable::On => output::GesturePolicy::On,
+        config::GestureEnable::Off => output::GesturePolicy::Off,
+        config::GestureEnable::Only(apps) => output::GesturePolicy::Only(apps.clone()),
+        config::GestureEnable::Except(apps) => output::GesturePolicy::Except(apps.clone()),
     }
 }
 
-fn resolve_swipe(c: &config::SwipeAxisCfg) -> output::SwipeBackend {
+fn resolve_swipe(c: &config::SwipeAxisCfg) -> output::SwipeConfig {
     let backend = match c.backend {
         config::SwipeBackend::Synthetic => output::SwipeBackend::Synthetic,
         config::SwipeBackend::Notification => output::SwipeBackend::Notification,
         config::SwipeBackend::Off => output::SwipeBackend::Off,
     };
-    if enable_to_bool(&c.enable) {
-        backend
-    } else {
-        output::SwipeBackend::Off
-    }
-}
-
-fn warn_app_filter_unwired(name: &str, en: &config::GestureEnable) {
-    match en {
-        config::GestureEnable::Only(apps) => log::warn!(
-            "[gestures.{name}] enable.only = {:?}: frontmost-app source not wired yet, gesture is OFF",
-            apps,
-        ),
-        config::GestureEnable::Except(apps) => log::warn!(
-            "[gestures.{name}] enable.except = {:?}: frontmost-app source not wired yet, gesture is ON",
-            apps,
-        ),
-        _ => {}
+    output::SwipeConfig {
+        policy: enable_to_policy(&c.enable),
+        backend,
     }
 }

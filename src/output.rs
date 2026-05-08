@@ -1,10 +1,10 @@
 //! macOS event synthesis. Public CGEvent APIs handle cursor, click, and
 //! phased smooth scroll. The private path (gated per-gesture by
-//! [`Config::pinch_enabled`] / [`Config::rotate_enabled`] / the swipe
-//! backend selectors) injects pinch, rotate, and swipe via undocumented
-//! CGEvent type/field IDs that BetterTouchTool, Karabiner-Elements, and
-//! similar tools have used for years — stable across recent macOS
-//! versions but not in any public Apple header.
+//! [`Config::pinch`] / [`Config::rotate`] / the swipe backend selectors)
+//! injects pinch, rotate, and swipe via undocumented CGEvent type/field
+//! IDs that BetterTouchTool, Karabiner-Elements, and similar tools have
+//! used for years — stable across recent macOS versions but not in any
+//! public Apple header.
 //!
 //! All field IDs and event-type constants used here are reverse-engineered
 //! from NSEvent type values; see the comments next to each declaration.
@@ -754,7 +754,7 @@ fn synthesize_gesture_event(
 
 // ---------- Public API ----------
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Config {
     /// Screen pixels emitted per millimeter of finger motion in scroll mode.
     pub scroll_accel: f64,
@@ -763,18 +763,68 @@ pub struct Config {
     /// "wheel" convention where finger-down moves the scrollbar down /
     /// the content up.
     pub natural_scroll: bool,
-    /// Emit private CGEvent pinch events. If false, [`Emitter::pinch`]
-    /// is a no-op. Independent of [`Self::rotate_enabled`].
-    pub pinch_enabled: bool,
-    /// Emit private CGEvent rotate events. If false, [`Emitter::rotate`]
-    /// is a no-op. Independent of [`Self::pinch_enabled`].
-    pub rotate_enabled: bool,
-    /// Backend for left/right 3F/4F swipes (Spaces / Full-Screen Apps).
-    /// `Notification` isn't a meaningful option here (no Dock notification
-    /// for "switch space"); it's silently treated as `Off`.
-    pub horizontal_swipe: SwipeBackend,
-    /// Backend for up/down 3F/4F swipes (Mission Control / App Exposé).
-    pub vertical_swipe: SwipeBackend,
+    /// Emit private CGEvent pinch events. Per-gesture gate evaluated at
+    /// `Phase::Began` against the bundle ID under the cursor; the
+    /// decision is held for the duration of the touch. Independent of
+    /// [`Self::rotate`].
+    pub pinch: GesturePolicy,
+    /// Emit private CGEvent rotate events. Same gating model as
+    /// [`Self::pinch`]; independent stream.
+    pub rotate: GesturePolicy,
+    /// Left/right 3F/4F swipes (Spaces / Full-Screen Apps).
+    /// `SwipeBackend::Notification` isn't a meaningful option here (no
+    /// Dock notification for "switch space"); it's silently treated as
+    /// `Off`.
+    pub horizontal_swipe: SwipeConfig,
+    /// Up/down 3F/4F swipes (Mission Control / App Exposé).
+    pub vertical_swipe: SwipeConfig,
+}
+
+/// Per-axis swipe configuration: `policy` gates the gesture against the
+/// bundle ID under the cursor at `Phase::Began`; `backend` chooses the
+/// wire path (live DockSwipe synthesis vs. discrete dock notification)
+/// once the policy admits the gesture.
+#[derive(Clone, Debug)]
+pub struct SwipeConfig {
+    pub policy: GesturePolicy,
+    pub backend: SwipeBackend,
+}
+
+/// Per-gesture admission policy. Evaluated at `Phase::Began` against
+/// the bundle ID of the application owning the topmost normal window
+/// under the cursor; the resulting decision (allow / deny) is held for
+/// the rest of the gesture so a mid-gesture window switch can't kill
+/// its own gesture.
+///
+/// `Only` denies when no app is under the cursor (e.g. desktop /
+/// menu bar). `Except` allows in that case.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GesturePolicy {
+    On,
+    Off,
+    Only(Vec<String>),
+    Except(Vec<String>),
+}
+
+impl GesturePolicy {
+    /// Decide whether to admit a gesture given a function that resolves
+    /// the bundle ID under the cursor. The closure is only invoked for
+    /// `Only` / `Except` so the on/off fast path stays free of system
+    /// queries.
+    pub fn evaluate(&self, lookup: impl FnOnce() -> Option<String>) -> bool {
+        match self {
+            GesturePolicy::On => true,
+            GesturePolicy::Off => false,
+            GesturePolicy::Only(list) => match lookup() {
+                Some(id) => list.iter().any(|x| x == &id),
+                None => false,
+            },
+            GesturePolicy::Except(list) => match lookup() {
+                Some(id) => !list.iter().any(|x| x == &id),
+                None => true,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -825,6 +875,17 @@ pub trait Output {
     /// so test fakes that don't care about timestamps don't have to
     /// implement it.
     fn set_event_time(&self, _ts: Timestamp) {}
+    /// Whether pinch / rotate / per-axis swipe are currently admissible
+    /// under the active output's policy. The gesture engine consults
+    /// these once at gesture start (when it stages the per-gesture
+    /// baseline) and uses the snapshot to gate which modes are
+    /// candidates for the lock decision — so an app that doesn't allow
+    /// pinch/rotate doesn't strand a 2F gesture in pinch+rotate when
+    /// the user meant to scroll. Defaults are admissive so test fakes
+    /// don't have to thread policy through.
+    fn pinch_admissible_now(&self) -> bool { true }
+    fn rotate_admissible_now(&self) -> bool { true }
+    fn swipe_admissible_now(&self, _axis: SwipeAxis) -> bool { true }
     /// Post a cursor move with the given pixel deltas. The gesture
     /// engine has already applied any acceleration curve and rounded
     /// to integer pixels (carrying the sub-pixel residual across
@@ -911,6 +972,15 @@ impl<O: Output> OverlayOutput<O> {
 impl<O: Output> Output for OverlayOutput<O> {
     fn set_event_time(&self, ts: Timestamp) {
         self.inner.set_event_time(ts);
+    }
+    fn pinch_admissible_now(&self) -> bool {
+        self.inner.pinch_admissible_now()
+    }
+    fn rotate_admissible_now(&self) -> bool {
+        self.inner.rotate_admissible_now()
+    }
+    fn swipe_admissible_now(&self, axis: SwipeAxis) -> bool {
+        self.inner.swipe_admissible_now(axis)
     }
     fn move_cursor_by(&self, dx_px: i32, dy_px: i32) {
         self.inner.move_cursor_by(dx_px, dy_px);
@@ -1019,7 +1089,10 @@ pub struct Emitter {
 /// Inertia state. All cells are accessed only from the main run loop
 /// thread (CFRunLoopTimer fires there), so `Cell` is sufficient.
 struct Momentum {
-    cfg: Config,
+    /// Mirror of `Config::scroll_accel` — the only Config field the
+    /// momentum integrator reads. Narrowed so Momentum doesn't have to
+    /// hold the whole (now `Vec<String>`-bearing) Config.
+    scroll_accel: f64,
     /// Same persistent CGEventSource the Emitter holds. Aliased here
     /// (not retained separately) because the timer callback needs to
     /// post events but doesn't have the Emitter handy. Lifetime is the
@@ -1055,6 +1128,7 @@ impl Emitter {
                  scroll bounce-back may not engage in WebKit / Chrome"
             );
         }
+        let scroll_accel = cfg.scroll_accel;
         Self {
             cfg,
             event_source,
@@ -1064,7 +1138,7 @@ impl Emitter {
             scroll_carry_y_px: Cell::new(0.0),
             scroll_last_time: Cell::new(None),
             momentum: Box::new(Momentum {
-                cfg,
+                scroll_accel,
                 event_source,
                 vel_x_mm_per_sec: Cell::new(0.0),
                 vel_y_mm_per_sec: Cell::new(0.0),
@@ -1334,10 +1408,6 @@ impl Emitter {
     /// since the last event (e.g. 0.05 = 5% bigger). Phase brackets are
     /// required for apps to track the gesture.
     pub fn pinch(&self, delta: f64, phase: Phase) {
-        if !self.cfg.pinch_enabled {
-            log::trace!("post: pinch suppressed (pinch_enabled=false)");
-            return;
-        }
         if let Some(e) = synthesize_gesture_event(
             GESTURE_SUBTYPE_MAGNIFY,
             iohid_gesture_phase(phase),
@@ -1353,10 +1423,6 @@ impl Emitter {
     /// since the last event, positive = counterclockwise (matching
     /// NSEvent.rotation semantics).
     pub fn rotate(&self, delta_degrees: f64, phase: Phase) {
-        if !self.cfg.rotate_enabled {
-            log::trace!("post: rotate suppressed (rotate_enabled=false)");
-            return;
-        }
         if let Some(e) = synthesize_gesture_event(
             GESTURE_SUBTYPE_ROTATE,
             iohid_gesture_phase(phase),
@@ -1391,8 +1457,8 @@ impl Emitter {
     /// so this function negates both before sending.
     pub fn swipe(&self, axis: SwipeAxis, signed_progress: f64, velocity_mm_per_sec: f64, phase: Phase) {
         let backend = match axis {
-            SwipeAxis::Horizontal => self.cfg.horizontal_swipe,
-            SwipeAxis::Vertical => self.cfg.vertical_swipe,
+            SwipeAxis::Horizontal => self.cfg.horizontal_swipe.backend,
+            SwipeAxis::Vertical => self.cfg.vertical_swipe.backend,
         };
         match (backend, axis) {
             (SwipeBackend::Off, _) | (SwipeBackend::Notification, SwipeAxis::Horizontal) => {
@@ -1770,8 +1836,8 @@ impl Momentum {
         // power curve as the active-scroll path so the user feels a
         // continuous deceleration from flick → coast (rather than a
         // step at lift from "amplified" to "linear").
-        let dx_px = accelerate_scroll(vx, self.cfg.scroll_accel) * dt;
-        let dy_px = accelerate_scroll(vy, self.cfg.scroll_accel) * dt;
+        let dx_px = accelerate_scroll(vx, self.scroll_accel) * dt;
+        let dy_px = accelerate_scroll(vy, self.scroll_accel) * dt;
         let total_x = self.carry_x_px.get() + dx_px;
         let total_y = self.carry_y_px.get() + dy_px;
         let int_x = total_x.trunc() as i32;
@@ -1847,6 +1913,37 @@ impl Output for Emitter {
     fn set_event_time(&self, ts: Timestamp) {
         self.event_time.set(Some(ts));
     }
+    fn pinch_admissible_now(&self) -> bool {
+        let admit = self
+            .cfg
+            .pinch
+            .evaluate(crate::app_context::bundle_id_under_cursor);
+        if !admit {
+            log::debug!("admit: pinch denied by policy {:?}", self.cfg.pinch);
+        }
+        admit
+    }
+    fn rotate_admissible_now(&self) -> bool {
+        let admit = self
+            .cfg
+            .rotate
+            .evaluate(crate::app_context::bundle_id_under_cursor);
+        if !admit {
+            log::debug!("admit: rotate denied by policy {:?}", self.cfg.rotate);
+        }
+        admit
+    }
+    fn swipe_admissible_now(&self, axis: SwipeAxis) -> bool {
+        let policy = match axis {
+            SwipeAxis::Horizontal => &self.cfg.horizontal_swipe.policy,
+            SwipeAxis::Vertical => &self.cfg.vertical_swipe.policy,
+        };
+        let admit = policy.evaluate(crate::app_context::bundle_id_under_cursor);
+        if !admit {
+            log::debug!("admit: swipe.{:?} denied by policy {:?}", axis, policy);
+        }
+        admit
+    }
     fn move_cursor_by(&self, dx_px: i32, dy_px: i32) {
         Emitter::move_cursor_by(self, dx_px, dy_px);
     }
@@ -1873,5 +1970,50 @@ impl Output for Emitter {
     }
     fn swipe(&self, axis: SwipeAxis, signed_progress: f64, velocity_mm_per_sec: f64, phase: Phase) {
         Emitter::swipe(self, axis, signed_progress, velocity_mm_per_sec, phase);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_on_admits_without_calling_lookup() {
+        let mut called = false;
+        let admit = GesturePolicy::On.evaluate(|| {
+            called = true;
+            Some("com.apple.Safari".into())
+        });
+        assert!(admit);
+        assert!(!called, "lookup should be skipped on the fast path");
+    }
+
+    #[test]
+    fn policy_off_denies_without_calling_lookup() {
+        let mut called = false;
+        let admit = GesturePolicy::Off.evaluate(|| {
+            called = true;
+            None
+        });
+        assert!(!admit);
+        assert!(!called);
+    }
+
+    #[test]
+    fn policy_only_admits_match_denies_other() {
+        let allow = vec!["com.apple.Safari".into()];
+        let p = GesturePolicy::Only(allow);
+        assert!(p.evaluate(|| Some("com.apple.Safari".into())));
+        assert!(!p.evaluate(|| Some("com.apple.Terminal".into())));
+        assert!(!p.evaluate(|| None), "no app under cursor → Only denies");
+    }
+
+    #[test]
+    fn policy_except_denies_match_admits_other() {
+        let deny = vec!["com.apple.Terminal".into()];
+        let p = GesturePolicy::Except(deny);
+        assert!(!p.evaluate(|| Some("com.apple.Terminal".into())));
+        assert!(p.evaluate(|| Some("com.apple.Safari".into())));
+        assert!(p.evaluate(|| None), "no app under cursor → Except admits");
     }
 }

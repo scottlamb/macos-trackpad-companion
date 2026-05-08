@@ -218,6 +218,16 @@ struct TwoFingerBaseline {
     /// crossing commits regardless of pan's status. Bounded to one frame
     /// so a real pinch only feels ~one chip-frame slower to onset.
     pinch_rot_lock_pending: bool,
+    /// Whether pinch / rotate are admissible for the app under the
+    /// cursor at the moment this 2F gesture started. Sampled once via
+    /// [`Output::pinch_admissible_now`] / [`Output::rotate_admissible_now`]
+    /// and held for the duration of the touch. When `false`, the
+    /// corresponding score is forced to zero in the lock decision so a
+    /// 2F gesture in an app that doesn't support pinch (e.g. iTerm2)
+    /// can't lock into TwoFingerPinchAndRotate when the user meant
+    /// scroll. With both `false`, only TwoFingerPan is reachable.
+    pinch_admitted: bool,
+    rotate_admitted: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -235,6 +245,12 @@ struct MultiBaseline {
     /// finger-count drop so we don't emit an orphaned Ended on a
     /// gesture that never crossed the axis-lock threshold.
     began_posted: bool,
+    /// Per-axis admission for swipes, sampled at the start of the 3F/4F
+    /// gesture. Used in axis-lock to refuse the dominant axis if it
+    /// isn't admitted under the cursor — the gesture stays unlocked
+    /// rather than firing a swipe the policy would have suppressed.
+    swipe_horizontal_admitted: bool,
+    swipe_vertical_admitted: bool,
     /// Most recent centroid sample. Used to derive the per-frame
     /// motion delta for velocity tracking; avoids re-deriving from
     /// each contact's previous-frame state.
@@ -735,6 +751,13 @@ impl<O: Output> State<O> {
                 let dy = b.y - a.y;
                 let dist = (dx * dx + dy * dy).sqrt().max(1e-9);
                 let ang = dy.atan2(dx);
+                let pinch_admitted = self.out.pinch_admissible_now();
+                let rotate_admitted = self.out.rotate_admissible_now();
+                if !pinch_admitted || !rotate_admitted {
+                    log::debug!(
+                        "2F gesture start: admit pinch={pinch_admitted} rotate={rotate_admitted}"
+                    );
+                }
                 self.two_baseline = Some(TwoFingerBaseline {
                     initial_distance: dist,
                     initial_angle: ang,
@@ -749,11 +772,22 @@ impl<O: Output> State<O> {
                     scroll_velocity: (0.0, 0.0),
                     last_scroll_time: None,
                     pinch_rot_lock_pending: false,
+                    pinch_admitted,
+                    rotate_admitted,
                 });
             }
             GestureKind::ThreeFingerLive | GestureKind::FourFingerLive => {
                 let cx: f64 = active.iter().map(|c| c.x).sum::<f64>() / active.len() as f64;
                 let cy: f64 = active.iter().map(|c| c.y).sum::<f64>() / active.len() as f64;
+                let swipe_horizontal_admitted =
+                    self.out.swipe_admissible_now(SwipeAxis::Horizontal);
+                let swipe_vertical_admitted = self.out.swipe_admissible_now(SwipeAxis::Vertical);
+                if !swipe_horizontal_admitted || !swipe_vertical_admitted {
+                    log::debug!(
+                        "multi-finger gesture start: admit swipe.h={swipe_horizontal_admitted} \
+                         swipe.v={swipe_vertical_admitted}"
+                    );
+                }
                 self.multi_baseline = Some(MultiBaseline {
                     initial_centroid: (cx, cy),
                     axis: None,
@@ -761,6 +795,8 @@ impl<O: Output> State<O> {
                     last_centroid: (cx, cy),
                     last_centroid_time: None,
                     velocity: (0.0, 0.0),
+                    swipe_horizontal_admitted,
+                    swipe_vertical_admitted,
                 });
             }
             _ => {}
@@ -991,12 +1027,17 @@ impl<O: Output> State<O> {
             //     trailer commits.
             let pinch_rot_admissible = min_per_finger >= TAP_MAX_MOVE_MM
                 || min_per_finger < ANCHORED_FINGER_FLOOR_MM;
-            let pinch = if pinch_rot_admissible {
+            // Zero out modes the under-cursor app's policy doesn't admit
+            // (sampled at gesture start in `transition`). With both
+            // zeroed, only `pan` can ever cross — a 2F gesture in an
+            // app that doesn't allow pinch/rotate falls through to
+            // scroll instead of locking pinch+rotate-but-suppressed.
+            let pinch = if pinch_rot_admissible && base.pinch_admitted {
                 (dist / base.initial_distance - 1.0).abs() / PINCH_LOCK_RATIO
             } else {
                 0.0
             };
-            let rot = if pinch_rot_admissible {
+            let rot = if pinch_rot_admissible && base.rotate_admitted {
                 angle_delta(ang, base.initial_angle).abs() / ROTATE_LOCK_RAD
             } else {
                 0.0
@@ -1193,11 +1234,25 @@ impl<O: Output> State<O> {
                 self.multi_baseline = Some(base);
                 return;
             }
-            base.axis = Some(if dx.abs() >= dy.abs() {
+            let candidate = if dx.abs() >= dy.abs() {
                 SwipeAxis::Horizontal
             } else {
                 SwipeAxis::Vertical
-            });
+            };
+            let admitted = match candidate {
+                SwipeAxis::Horizontal => base.swipe_horizontal_admitted,
+                SwipeAxis::Vertical => base.swipe_vertical_admitted,
+            };
+            if !admitted {
+                // Dominant axis isn't admitted under the cursor — refuse
+                // to lock rather than firing a swipe the policy would
+                // suppress. Fingers may pivot to the other axis later;
+                // we keep re-evaluating each frame until a finger lifts.
+                base.last_centroid = (cx, cy);
+                self.multi_baseline = Some(base);
+                return;
+            }
+            base.axis = Some(candidate);
         }
         let axis = base.axis.expect("axis just locked");
 
@@ -1250,7 +1305,6 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    #[derive(Default)]
     struct Recorder {
         log: RefCell<Vec<String>>,
         /// What `cancel_inertia` should report. Toggle on with
@@ -1259,6 +1313,26 @@ mod tests {
         /// (just like the real Emitter would when its CFRunLoopTimer is
         /// live) and clears the flag.
         inertia_active: std::cell::Cell<bool>,
+        /// Per-mode admission overrides. Default-true so existing tests
+        /// (predating the under-cursor policy) keep passing without
+        /// modification; the dedicated admit tests flip these off.
+        pinch_admit: std::cell::Cell<bool>,
+        rotate_admit: std::cell::Cell<bool>,
+        swipe_horizontal_admit: std::cell::Cell<bool>,
+        swipe_vertical_admit: std::cell::Cell<bool>,
+    }
+
+    impl Default for Recorder {
+        fn default() -> Self {
+            Self {
+                log: RefCell::new(Vec::new()),
+                inertia_active: std::cell::Cell::new(false),
+                pinch_admit: std::cell::Cell::new(true),
+                rotate_admit: std::cell::Cell::new(true),
+                swipe_horizontal_admit: std::cell::Cell::new(true),
+                swipe_vertical_admit: std::cell::Cell::new(true),
+            }
+        }
     }
 
     impl Recorder {
@@ -1267,6 +1341,12 @@ mod tests {
         }
         fn set_inertia_active(&self, active: bool) {
             self.inertia_active.set(active);
+        }
+        fn deny_pinch(&self) {
+            self.pinch_admit.set(false);
+        }
+        fn deny_rotate(&self) {
+            self.rotate_admit.set(false);
         }
     }
 
@@ -1314,6 +1394,18 @@ mod tests {
             self.log.borrow_mut().push(format!(
                 "swipe {axis:?} {signed_progress:+.3} v={velocity:+.1} {phase:?}"
             ));
+        }
+        fn pinch_admissible_now(&self) -> bool {
+            self.pinch_admit.get()
+        }
+        fn rotate_admissible_now(&self) -> bool {
+            self.rotate_admit.get()
+        }
+        fn swipe_admissible_now(&self, axis: SwipeAxis) -> bool {
+            match axis {
+                SwipeAxis::Horizontal => self.swipe_horizontal_admit.get(),
+                SwipeAxis::Vertical => self.swipe_vertical_admit.get(),
+            }
         }
     }
 
@@ -1458,6 +1550,54 @@ mod tests {
             "{log:?}"
         );
         assert!(log.iter().any(|l| l.contains("Ended")), "{log:?}");
+    }
+
+    /// When pinch and rotate are both denied for the under-cursor app,
+    /// a 2F spread (which would normally lock pinch) must NOT fire any
+    /// pinch or rotate events. The user's intent in such an app is
+    /// scroll; with no centroid translation here, the gesture stays
+    /// unclassified — better than firing an unintended pinch.
+    #[test]
+    fn two_finger_spread_with_pinch_denied_emits_nothing() {
+        let r = Recorder::default();
+        r.deny_pinch();
+        r.deny_rotate();
+        let mut s = State::new(&r, test_accel());
+        s.on_frame(frame(&[(1, 0.45, 0.5), (2, 0.55, 0.5)]));
+        s.on_frame(frame(&[(1, 0.4, 0.5), (2, 0.6, 0.5)]));
+        s.on_frame(frame(&[(1, 0.3, 0.5), (2, 0.7, 0.5)]));
+        s.on_frame(frame(&[]));
+        let log = r.pop();
+        assert!(
+            !log.iter().any(|l| l.starts_with("pinch") || l.starts_with("rotate")),
+            "denied policy must suppress pinch/rotate: {log:?}"
+        );
+    }
+
+    /// When pinch and rotate are denied but the user does a real 2F
+    /// scroll (parallel motion, no spread/twist), pan still locks
+    /// normally and scroll fires. This is the path that lets the user
+    /// "scroll in iTerm2" without 2F gestures spuriously locking
+    /// pinch+rotate.
+    #[test]
+    fn two_finger_pan_with_pinch_denied_still_scrolls() {
+        let r = Recorder::default();
+        r.deny_pinch();
+        r.deny_rotate();
+        let mut s = State::new(&r, test_accel());
+        s.on_frame(frame(&[(1, 0.4, 0.5), (2, 0.6, 0.5)]));
+        s.on_frame(frame(&[(1, 0.4, 0.55), (2, 0.6, 0.55)]));
+        s.on_frame(frame(&[(1, 0.4, 0.6), (2, 0.6, 0.6)]));
+        s.on_frame(frame(&[]));
+        let log = r.pop();
+        assert!(
+            log.iter().any(|l| l.starts_with("scroll") && l.contains("Began")),
+            "denied pinch/rotate must not block scroll: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("pinch") || l.starts_with("rotate")),
+            "{log:?}"
+        );
     }
 
     #[test]
