@@ -875,6 +875,86 @@ pub trait Output {
     fn swipe(&self, axis: SwipeAxis, signed_progress: f64, velocity_mm_per_sec: f64, phase: Phase);
 }
 
+/// Decorator over an [`Output`] that flashes a debug HUD on each
+/// `Phase::Began` — the moments where the gesture engine commits to
+/// scroll vs pinch+rotate, or locks a swipe axis. `pinch.Began` and
+/// `rotate.Began` are emitted back-to-back at the same lock instant
+/// (see `gesture.rs`'s `TwoFingerPinchAndRotate` mode), so we flash on
+/// pinch only and elide rotate to keep it to one badge per gesture.
+pub struct OverlayOutput<O: Output> {
+    inner: O,
+    overlay: Box<crate::overlay::Overlay>,
+    /// Per-flash counter. Same number is rendered on the HUD and logged
+    /// at info level so a `grep '#42'` in the logs lands on the matching
+    /// gesture-lock event. `Cell` is fine: all `Output` calls run on the
+    /// IOHID/main-thread run loop.
+    seq: Cell<u64>,
+}
+
+impl<O: Output> OverlayOutput<O> {
+    pub fn new(inner: O, overlay: Box<crate::overlay::Overlay>) -> Self {
+        Self {
+            inner,
+            overlay,
+            seq: Cell::new(0),
+        }
+    }
+
+    fn flash(&self, name: &str) {
+        let n = self.seq.get().wrapping_add(1);
+        self.seq.set(n);
+        log::info!("overlay #{n}: {name}");
+        self.overlay.flash(name, n);
+    }
+}
+
+impl<O: Output> Output for OverlayOutput<O> {
+    fn set_event_time(&self, ts: Timestamp) {
+        self.inner.set_event_time(ts);
+    }
+    fn move_cursor_by(&self, dx_px: i32, dy_px: i32) {
+        self.inner.move_cursor_by(dx_px, dy_px);
+    }
+    fn click(&self, button: MouseButton) {
+        self.inner.click(button);
+    }
+    fn set_left_button_held(&self, held: bool) {
+        self.inner.set_left_button_held(held);
+    }
+    fn scroll(&self, dx_mm: f64, dy_mm: f64, phase: Phase) {
+        if matches!(phase, Phase::Began) {
+            self.flash("SCROLL");
+        }
+        self.inner.scroll(dx_mm, dy_mm, phase);
+    }
+    fn scroll_inertia(&self, vx_mm_per_sec: f64, vy_mm_per_sec: f64) {
+        self.inner.scroll_inertia(vx_mm_per_sec, vy_mm_per_sec);
+    }
+    fn cancel_inertia(&self) -> bool {
+        self.inner.cancel_inertia()
+    }
+    fn pinch(&self, delta: f64, phase: Phase) {
+        if matches!(phase, Phase::Began) {
+            self.flash("PINCH / ROTATE");
+        }
+        self.inner.pinch(delta, phase);
+    }
+    fn rotate(&self, delta_degrees: f64, phase: Phase) {
+        // Paired with pinch at lock-in; intentionally no flash here.
+        self.inner.rotate(delta_degrees, phase);
+    }
+    fn swipe(&self, axis: SwipeAxis, signed_progress: f64, velocity_mm_per_sec: f64, phase: Phase) {
+        if matches!(phase, Phase::Began) {
+            let label = match axis {
+                SwipeAxis::Horizontal => "SWIPE  \u{2194}",
+                SwipeAxis::Vertical => "SWIPE  \u{2195}",
+            };
+            self.flash(label);
+        }
+        self.inner.swipe(axis, signed_progress, velocity_mm_per_sec, phase);
+    }
+}
+
 pub struct Emitter {
     cfg: Config,
     /// Persistent CGEventSource. Created with

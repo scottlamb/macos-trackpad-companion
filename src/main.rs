@@ -22,6 +22,7 @@ mod gesture;
 mod hid;
 mod instance_lock;
 mod output;
+mod overlay;
 mod report;
 mod scan_clock;
 mod time;
@@ -103,15 +104,21 @@ fn main() -> Result<()> {
         ref_mm_per_sec: cfg.cursor.accel_ref,
     };
     let emitter = output::Emitter::new(out_cfg);
-    let mut state = gesture::State::new(emitter, cursor_accel);
-
     let mut manager = hid::Manager::new(hid::Filter {
         vid: cfg.device.vid,
         pid: cfg.device.pid,
     })
     .context("open IOHIDManager")?;
 
-    manager.run(move |frame, ts| state.on_frame_at(frame, ts))?;
+    if cfg.overlay.enable {
+        let overlay = overlay::Overlay::new(cfg.overlay.duration_ms);
+        let wrapped = output::OverlayOutput::new(emitter, overlay);
+        let mut state = gesture::State::new(wrapped, cursor_accel);
+        manager.run(move |frame, ts| state.on_frame_at(frame, ts))?;
+    } else {
+        let mut state = gesture::State::new(emitter, cursor_accel);
+        manager.run(move |frame, ts| state.on_frame_at(frame, ts))?;
+    }
 
     Ok(())
 }

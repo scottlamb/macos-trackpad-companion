@@ -34,6 +34,10 @@
 //! [gestures.swipe.vertical]
 //! enable  = "on"
 //! backend = "synthetic"
+//!
+//! [overlay]                        # debug HUD; off by default
+//! enable      = false
+//! duration_ms = 600
 //! ```
 
 use anyhow::{Context, Result};
@@ -48,6 +52,23 @@ pub struct Config {
     pub cursor: Cursor,
     pub scroll: Scroll,
     pub gestures: Gestures,
+    pub overlay: Overlay,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields, default)]
+pub struct Overlay {
+    pub enable: bool,
+    pub duration_ms: u32,
+}
+
+impl Default for Overlay {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            duration_ms: 600,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Default, Clone)]
