@@ -106,6 +106,39 @@ permissions; without them the companion exits with an actionable error.
   clicks, scroll, gestures). Granted via System Settings → Privacy &
   Security → Accessibility.
 
+## Reading the logs
+
+When a two-finger gesture locks (the moment the companion commits to
+either scroll or pinch+rotate), an `INFO` line records all three
+candidate scores and the geometric inputs that drove the choice:
+
+```
+2F lock=pinch+rotate scores[pinch=1.56 rot=1.35 pan=0.42 disq:margin] common=0.42mm diff=1.45mm align=0.62 balance=0.45
+```
+
+A score `≥ 1.00` means that signal crossed its lock threshold. Pan is
+mutually exclusive with pinch+rotate and only wins if it both crosses
+*and* dominates; otherwise the pair locks.
+
+Tags after a score say *why* it didn't compete:
+
+| Tag | Meaning |
+| --- | --- |
+| `disq:margin` | Pan: centroid translation didn't beat differential motion by 20% — most of the motion is asymmetric, not translational. |
+| `disq:participation` | Pan: margin OK, but neither finger balance (slower ≥ 30% of faster) nor alignment (motion vectors near-parallel) qualified. |
+| `gated:noise` | Pinch/rot: one finger sat in the 0.3–1.0 mm noise band where differential signal is dominated by jitter; lock deferred. |
+| `gated:policy` | Pinch/rot: the under-cursor app's `enable` policy blocked this gesture, so the score was zeroed for selection. |
+
+Trailing fields:
+
+- `common` — magnitude of the shared (centroid) translation in mm.
+- `diff` — magnitude of the per-finger differential motion in mm.
+- `align` — cosine of the angle between the two fingers' motion vectors. ~1.0 = parallel, 0 = perpendicular, <0 = anti-parallel.
+- `balance` — slower finger's motion / faster finger's motion. 1.0 = symmetric, 0 = one finger anchored.
+
+For the contrasting case, `2F lock=scroll` uses the same format with
+`pan` first.
+
 ## Wire-format contract
 
 The companion parses the device's HID report descriptor at runtime, so
