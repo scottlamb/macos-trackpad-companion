@@ -14,6 +14,7 @@
 //!
 //! [log]
 //! level = "info"
+//! # file  = "~/Library/Logs/macos-trackpad-companion.log"
 //!
 //! [cursor]
 //! sensitivity   = 25.0
@@ -82,12 +83,17 @@ pub struct Device {
 #[serde(deny_unknown_fields, default)]
 pub struct Log {
     pub level: String,
+    /// If set, logs are appended to this path instead of stderr. A
+    /// leading `~/` is expanded against `$HOME`. Parent directories
+    /// are created on demand.
+    pub file: Option<PathBuf>,
 }
 
 impl Default for Log {
     fn default() -> Self {
         Self {
             level: "info".into(),
+            file: None,
         }
     }
 }
@@ -258,6 +264,26 @@ impl<'de> Deserialize<'de> for GestureEnable {
                 )),
             },
         }
+    }
+}
+
+/// Expand a leading `~/` (or bare `~`) against `$HOME`. Other path
+/// forms pass through untouched.
+pub fn expand_tilde(p: &Path) -> PathBuf {
+    let s = match p.to_str() {
+        Some(s) => s,
+        None => return p.to_path_buf(),
+    };
+    let home = match std::env::var_os("HOME") {
+        Some(h) if !h.is_empty() => PathBuf::from(h),
+        _ => return p.to_path_buf(),
+    };
+    if s == "~" {
+        home
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        p.to_path_buf()
     }
 }
 

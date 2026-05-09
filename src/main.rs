@@ -71,9 +71,23 @@ fn main() -> Result<()> {
     } else {
         cfg.log.level.clone()
     };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level.as_str()))
-        .format_timestamp_millis()
-        .init();
+    let mut log_builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level.as_str()));
+    log_builder.format_timestamp_millis();
+    let log_file_path = cfg.log.file.as_deref().map(config::expand_tilde);
+    if let Some(path) = log_file_path.as_deref() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create log dir {}", parent.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("open log file {}", path.display()))?;
+        log_builder.target(env_logger::Target::Pipe(Box::new(file)));
+    }
+    log_builder.init();
 
     if cfg_path.exists() {
         log::info!(

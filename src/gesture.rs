@@ -991,15 +991,25 @@ impl<O: Output> State<O> {
             } else {
                 -1.0
             };
-            let pan_qualified = common_mag > differential_mag * 1.2
-                && (min_per_finger >= max_per_finger * 0.3
-                    || alignment > PAN_ALIGNMENT_COS_MIN);
-
-            let pan = if pan_qualified {
-                common_mag / PAN_LOCK_MM
+            let margin_ok = common_mag > differential_mag * 1.2;
+            let balance = if max_per_finger > 0.0 {
+                min_per_finger / max_per_finger
             } else {
                 0.0
             };
+            let balance_ok = balance >= 0.3;
+            let aligned = alignment > PAN_ALIGNMENT_COS_MIN;
+            let pan_qualified = margin_ok && (balance_ok || aligned);
+
+            // Always-computed raw scores for the lock-decision log: a 0
+            // there should mean "didn't accumulate," not "qualification
+            // gate zeroed it." The selection scores below still gate on
+            // qualification so suppressed signals can't win.
+            let pan_raw = common_mag / PAN_LOCK_MM;
+            let pinch_raw = (dist / base.initial_distance - 1.0).abs() / PINCH_LOCK_RATIO;
+            let rot_raw = angle_delta(ang, base.initial_angle).abs() / ROTATE_LOCK_RAD;
+
+            let pan = if pan_qualified { pan_raw } else { 0.0 };
             // Pinch/rotate scoring is hypersensitive to per-finger noise on
             // a long lever arm: with fingers ~20 mm apart, sub-mm jitter
             // accumulated over a few hundred ms can drift the inter-finger
@@ -1033,12 +1043,12 @@ impl<O: Output> State<O> {
             // app that doesn't allow pinch/rotate falls through to
             // scroll instead of locking pinch+rotate-but-suppressed.
             let pinch = if pinch_rot_admissible && base.pinch_admitted {
-                (dist / base.initial_distance - 1.0).abs() / PINCH_LOCK_RATIO
+                pinch_raw
             } else {
                 0.0
             };
             let rot = if pinch_rot_admissible && base.rotate_admitted {
-                angle_delta(ang, base.initial_angle).abs() / ROTATE_LOCK_RAD
+                rot_raw
             } else {
                 0.0
             };
@@ -1100,15 +1110,45 @@ impl<O: Output> State<O> {
                     GestureKind::TwoFingerPinchAndRotate
                 };
                 self.kind = new_kind;
+                let pan_tag = if pan_qualified {
+                    String::new()
+                } else if !margin_ok {
+                    " disq:margin".to_string()
+                } else {
+                    " disq:participation".to_string()
+                };
+                let pinch_tag = if !pinch_rot_admissible {
+                    " gated:noise"
+                } else if !base.pinch_admitted {
+                    " gated:policy"
+                } else {
+                    ""
+                };
+                let rot_tag = if !pinch_rot_admissible {
+                    " gated:noise"
+                } else if !base.rotate_admitted {
+                    " gated:policy"
+                } else {
+                    ""
+                };
                 match new_kind {
                     GestureKind::TwoFingerPan => {
-                        log::debug!("scroll: began (pan_score={:.2})", pan);
+                        log::info!(
+                            "2F lock=scroll scores[pan={:.2}{} pinch={:.2}{} rot={:.2}{}] common={:.2}mm diff={:.2}mm align={:.2} balance={:.2}",
+                            pan_raw, pan_tag,
+                            pinch_raw, pinch_tag,
+                            rot_raw, rot_tag,
+                            common_mag, differential_mag, alignment, balance,
+                        );
                         self.out.scroll(0.0, 0.0, Phase::Began);
                     }
                     GestureKind::TwoFingerPinchAndRotate => {
-                        log::debug!(
-                            "pinch+rotate: began (pinch_score={:.2}, rot_score={:.2})",
-                            pinch, rot,
+                        log::info!(
+                            "2F lock=pinch+rotate scores[pinch={:.2}{} rot={:.2}{} pan={:.2}{}] common={:.2}mm diff={:.2}mm align={:.2} balance={:.2}",
+                            pinch_raw, pinch_tag,
+                            rot_raw, rot_tag,
+                            pan_raw, pan_tag,
+                            common_mag, differential_mag, alignment, balance,
                         );
                         // Both streams begin at lock so a downstream app
                         // subscribed to either gets a coherent

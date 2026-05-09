@@ -43,6 +43,9 @@ rejected so typos surface at startup.
 
 [log]
 level = "info"              # error | warn | info | debug | trace
+# file  = "~/Library/Logs/macos-trackpad-companion.log"
+                            # if set, logs are appended here instead of stderr;
+                            # `~/` is expanded and parent dirs are created.
 
 [cursor]
 sensitivity   = 25.0        # px per mm of finger motion at accel_ref
