@@ -49,6 +49,16 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    // Block SIGINT/SIGTERM in the main thread *before* any other code
+    // runs. Threads inherit the caller's signal mask at spawn time;
+    // a clean Ctrl+C only fires `DeviceState::drop` (which writes the
+    // firmware's "back to mouse" SET) if all threads have these
+    // signals blocked, so the dedicated sigwait worker installed
+    // later catches them. NSApplication, IOHIDManager, env_logger,
+    // anything that calls into a framework that internally
+    // pthread_create's must run after this.
+    hid::block_shutdown_signals();
+
     let args = Args::parse();
     let (cfg, cfg_path) = config::load(args.config.as_deref())?;
 

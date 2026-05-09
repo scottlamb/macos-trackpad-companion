@@ -276,14 +276,16 @@ impl Manager {
             self.filter.pid
         );
 
-        // Without an explicit teardown path the kernel SIGTERMs us straight
-        // to exit and `DeviceState::drop` (which reverts the firmware to
-        // mouse mode) never runs — the trackpad would stay stuck in PTP
-        // mode after the companion exits. Stop the run loop on signal so
-        // `CFRunLoopRun` returns and Rust unwinding drops the bridge
-        // normally. SIGKILL still skips this; the firmware-side heartbeat
-        // watchdog covers that case.
-        install_signal_shutdown();
+        // Spawn the sigwait worker. `block_shutdown_signals()` must
+        // have run from `main` before any thread-spawning framework
+        // call (IOHIDManager / NSApp / …) so every helper thread
+        // inherits the block; otherwise SIGINT can be delivered to a
+        // Cocoa thread that has it unblocked, default action
+        // (terminate) fires, and `DeviceState::drop` never runs —
+        // leaving the firmware stuck in PTP mode. SIGKILL still skips
+        // teardown; the firmware-side heartbeat watchdog covers that
+        // case.
+        install_shutdown_worker();
 
         // Heartbeat ticker: re-assert the PTP-control byte on every
         // matched device. Held in `_heartbeat_timer` so the
@@ -337,36 +339,52 @@ extern "C" fn on_heartbeat_tick(_timer: CFRunLoopTimerRef, info: *mut c_void) {
     }
 }
 
-/// Block SIGINT/SIGTERM in the main thread and spawn a sigwait worker
-/// that stops the main run loop when either arrives. `sigwait` on a
-/// dedicated thread is the supported way to handle signals from a
-/// CFRunLoop process (raw signal handlers can't safely call CF APIs;
-/// most CF functions aren't async-signal-safe).
+/// Block SIGINT/SIGTERM in the calling thread, *and in every thread
+/// spawned later by this process* (since spawned threads inherit the
+/// caller's signal mask). Must be called from `main` before any other
+/// thread-spawning work — IOHIDManager, NSApp, env_logger, anything
+/// that might call into a framework that internally `pthread_create`s.
+///
+/// Without this discipline, a signal arriving after a Cocoa /
+/// CoreGraphics helper thread starts will be delivered to that
+/// thread instead of waited for by [`install_shutdown_worker`], and
+/// the default action (process-wide terminate) skips
+/// `DeviceState::drop` — leaving the firmware stuck in PTP mode after
+/// the companion exits.
+///
+/// Idempotent: calling more than once is harmless. The sigwait worker
+/// itself (spawned by `install_shutdown_worker`) inherits the block,
+/// then unblocks via `sigwait` on the dedicated thread.
+pub fn block_shutdown_signals() {
+    use std::mem;
+    use std::ptr;
+    unsafe {
+        let mut set: libc::sigset_t = mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, ptr::null_mut());
+    }
+}
+
+/// Spawn a sigwait worker that stops the main run loop when SIGINT /
+/// SIGTERM arrives. Pairs with [`block_shutdown_signals`], which must
+/// have run first. `sigwait` on a dedicated thread is the supported
+/// way to handle signals from a CFRunLoop process (raw signal
+/// handlers can't safely call CF APIs; most CF functions aren't
+/// async-signal-safe).
 ///
 /// Must be called on the main thread (the one that will run
 /// `CFRunLoopRun`); the captured run loop is whichever
 /// `CFRunLoop::get_current()` returns at this call site.
-fn install_signal_shutdown() {
+fn install_shutdown_worker() {
     use std::mem;
-    use std::ptr;
 
     // The CFRunLoopRef from get_current() is reference-counted by Apple
     // but the main run loop has effectively static lifetime, so capturing
     // its raw pointer as a `usize` for the worker thread is safe.
     // Going through `usize` side-steps `!Send` on `CFRunLoop` itself.
     let run_loop_ref = CFRunLoop::get_current().as_concrete_TypeRef() as usize;
-
-    unsafe {
-        let mut set: libc::sigset_t = mem::zeroed();
-        libc::sigemptyset(&mut set);
-        libc::sigaddset(&mut set, libc::SIGINT);
-        libc::sigaddset(&mut set, libc::SIGTERM);
-        // Block in the main thread *before* spawning the worker so the
-        // worker inherits the block; otherwise a signal arriving between
-        // pthread_sigmask and the spawn would be delivered to the main
-        // thread (default-action: terminate) and we'd skip cleanup.
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, ptr::null_mut());
-    }
 
     std::thread::spawn(move || {
         unsafe {
