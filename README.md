@@ -11,7 +11,10 @@ because macOS has no built-in PTP consumer. macOS does have similar
 support for Apple's own Magic Trackpads, but their driver will only
 talk to USB devices using Apple's USB VID.
 
-macOS
+**Prototype-quality**, vibe-coded. The code is gross. But it works decently
+well for me and has served as a base for refining gesture recognition. It has
+tests inspired by real usage logs. Eventually I hope to distill what I've
+learned into a nice spec and develop a high-quality codebase from it.
 
 ## Build & run
 
@@ -213,11 +216,6 @@ on separate interfaces.
   could break on a future macOS update. Pass `--no-private-gestures` to
   disable them; cursor / click / phased scroll all use public CGEvent
   APIs and won't be affected.
-- **Hardware verification is pending.** The companion's gesture state
-  machine is unit-tested but not yet validated against a flashed PTP
-  device. Smoke-test plan: Photos.app pinch + rotate on a real photo;
-  Safari 3-finger swipe between back/forward; Mission Control 4-finger
-  swipe up.
 - **Two-finger ambiguity is resolved by first-significant-motion lock.**
   Once the centroid moves, the distance changes by 4%, or the angle
   changes by 6°, that mode wins for the duration of the touch. The

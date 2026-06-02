@@ -574,7 +574,15 @@ fn set_input_mode(device: IOHIDDeviceRef, mode: u8) {
 }
 
 fn set_feature_byte(device: IOHIDDeviceRef, report_id: isize, byte: u8) -> IOReturn {
-    let payload = [byte];
+    // For numbered reports, HID 1.11 §7.2.2 puts the Report ID byte at
+    // the head of the SET_REPORT control payload. Linux's
+    // `hid_output_report` builds the buffer that way; macOS
+    // `IOHIDDeviceSetReport` does NOT prepend automatically — it puts
+    // the `report_id` parameter in wValue and sends the buffer
+    // verbatim. So we have to include the prefix ourselves to match
+    // the wire format every other host produces. (hidapi follows the
+    // same convention.)
+    let payload = [report_id as u8, byte];
     unsafe {
         IOHIDDeviceSetReport(
             device,
