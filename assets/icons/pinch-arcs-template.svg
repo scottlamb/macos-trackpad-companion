@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18" width="18" height="18" role="img" aria-label="Pinch gesture menu bar template">
+  <!-- macOS template image: pure black on transparent. AppKit inverts it
+       for dark menu bars when the NSImage has isTemplate = true.
+
+       Redrawn, not scaled: the first attempt kept the app icon's
+       fingertip dots alongside small arrowheads and scattered into four
+       disconnected blobs at 18pt. Two large opposed triangles carry the
+       same meaning with half the parts. -->
+  <g fill="#000000">
+    <path d="M8.15 8.15 L6.88 2.64 L2.64 6.88 Z"/>
+    <path d="M9.85 9.85 L11.12 15.36 L15.36 11.12 Z"/>
+  </g>
+</svg>

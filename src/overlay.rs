@@ -11,21 +11,15 @@
 use std::cell::RefCell;
 use std::time::Duration;
 
-use core_foundation::base::TCFType;
-use core_foundation::date::CFAbsoluteTimeGetCurrent;
-use core_foundation::runloop::{
-    CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext, kCFRunLoopCommonModes,
-};
-use core_foundation_sys::runloop::CFRunLoopTimerRef;
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSFont,
-    NSPanel, NSScreen, NSTextAlignment, NSTextField, NSWindowStyleMask,
+    NSBackingStoreType, NSColor, NSFont, NSPanel, NSScreen, NSTextAlignment, NSTextField,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
-use std::ffi::c_void;
+use crate::run_loop_timer::Timer;
 
 const PANEL_WIDTH: f64 = 320.0;
 const PANEL_HEIGHT: f64 = 72.0;
@@ -44,12 +38,7 @@ pub struct Overlay {
     /// Pending hide timer. Replaced on each `flash()` so a rapid second
     /// flash extends the visible window rather than letting the first
     /// timer cut it short.
-    hide_timer: RefCell<Option<CFRunLoopTimer>>,
-    /// Self-pointer the timer callback uses to find us. Stored as a raw
-    /// usize so it doesn't trip aliasing checks; the `Box<Overlay>` is
-    /// owned by `main` for the duration of the daemon, so the pointer
-    /// is valid for as long as the timer can fire.
-    self_addr: usize,
+    hide_timer: RefCell<Option<Timer>>,
 }
 
 impl Overlay {
@@ -57,14 +46,12 @@ impl Overlay {
     /// `MainThreadMarker` enforces this) — AppKit constructors panic
     /// otherwise.
     pub fn new(duration_ms: u32) -> Box<Self> {
-        let mtm = MainThreadMarker::new()
-            .expect("Overlay::new must run on the main thread");
+        let mtm = MainThreadMarker::new().expect("Overlay::new must run on the main thread");
 
-        // Bring up NSApp as an accessory so the daemon doesn't grow a
-        // Dock icon or steal focus. Idempotent if NSApp already exists.
-        let app = NSApplication::sharedApplication(mtm);
-        app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
-        app.finishLaunching();
+        // Shared with the menu-bar status item — whichever feature is
+        // enabled first brings NSApp up, and neither overrides the
+        // other's activation policy.
+        crate::app_kit::ensure_app(mtm);
 
         let screen_frame = NSScreen::mainScreen(mtm)
             .map(|s| s.frame())
@@ -72,11 +59,9 @@ impl Overlay {
                 NSPoint::new(0.0, 0.0),
                 NSSize::new(1440.0, 900.0),
             ));
-        let origin_x =
-            screen_frame.origin.x + (screen_frame.size.width - PANEL_WIDTH) / 2.0;
+        let origin_x = screen_frame.origin.x + (screen_frame.size.width - PANEL_WIDTH) / 2.0;
         // AppKit Y grows upward from the bottom of the screen.
-        let origin_y =
-            screen_frame.origin.y + screen_frame.size.height - TOP_INSET - PANEL_HEIGHT;
+        let origin_y = screen_frame.origin.y + screen_frame.size.height - TOP_INSET - PANEL_HEIGHT;
         let rect = NSRect::new(
             NSPoint::new(origin_x, origin_y),
             NSSize::new(PANEL_WIDTH, PANEL_HEIGHT),
@@ -92,6 +77,7 @@ impl Overlay {
             false,
         );
 
+        unsafe { panel.setReleasedWhenClosed(false) };
         panel.setOpaque(false);
         let bg = NSColor::colorWithCalibratedRed_green_blue_alpha(0.0, 0.0, 0.0, 0.72);
         panel.setBackgroundColor(Some(&bg));
@@ -139,64 +125,38 @@ impl Overlay {
         content.addSubview(&name_label);
         content.addSubview(&seq_label);
 
-        let me = Box::new(Self {
+        Box::new(Self {
             panel,
             name_label,
             seq_label,
             duration: Duration::from_millis(duration_ms.max(50) as u64),
             hide_timer: RefCell::new(None),
-            self_addr: 0,
-        });
-        let raw = Box::into_raw(me);
-        unsafe {
-            (*raw).self_addr = raw as usize;
-            Box::from_raw(raw)
-        }
+        })
     }
 
     /// Show a gesture badge and (re)start the auto-hide timer. `name`
     /// goes on the top line, `#seq` on the bottom — the seq matches the
     /// `overlay #N: …` log line emitted by the caller.
     pub fn flash(&self, name: &str, seq: u64) {
-        self.name_label
-            .setStringValue(&NSString::from_str(name));
+        self.name_label.setStringValue(&NSString::from_str(name));
         self.seq_label
             .setStringValue(&NSString::from_str(&format!("#{seq}")));
         self.panel.orderFrontRegardless();
 
-        // Cancel the previous hide-timer (if any) and install a fresh one.
-        if let Some(prev) = self.hide_timer.borrow_mut().take() {
-            unsafe {
-                core_foundation_sys::runloop::CFRunLoopTimerInvalidate(
-                    prev.as_concrete_TypeRef(),
-                );
-            }
-        }
-
-        let fire_at = unsafe { CFAbsoluteTimeGetCurrent() } + self.duration.as_secs_f64();
-        let mut ctx = CFRunLoopTimerContext {
-            version: 0,
-            info: self.self_addr as *mut c_void,
-            retain: None,
-            release: None,
-            copyDescription: None,
-        };
-        let timer = CFRunLoopTimer::new(fire_at, 0.0, 0, 0, hide_callback, &mut ctx);
-        let mode = unsafe { kCFRunLoopCommonModes };
-        CFRunLoop::get_current().add_timer(&timer, mode);
-        *self.hide_timer.borrow_mut() = Some(timer);
-    }
-
-    fn hide(&self) {
-        self.panel.orderOut(None);
+        // Capturing the panel avoids a raw pointer into this movable
+        // owner. Dropping/replacing the guard cancels the pending hide.
         self.hide_timer.borrow_mut().take();
+        let panel = self.panel.clone();
+        let timer = Timer::new(self.duration.as_secs_f64(), 0.0, move || {
+            panel.orderOut(None);
+        });
+        *self.hide_timer.borrow_mut() = Some(timer);
     }
 }
 
-extern "C" fn hide_callback(_timer: CFRunLoopTimerRef, info: *mut c_void) {
-    if info.is_null() {
-        return;
+impl Drop for Overlay {
+    fn drop(&mut self) {
+        self.hide_timer.get_mut().take();
+        self.panel.orderOut(None);
     }
-    let overlay = unsafe { &*(info as *const Overlay) };
-    overlay.hide();
 }

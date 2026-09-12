@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img" aria-label="macos-trackpad-companion — pinch gesture icon">
+  <defs>
+    <linearGradient id="pinchBg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3A4049"/>
+      <stop offset="1" stop-color="#15181C"/>
+    </linearGradient>
+    <linearGradient id="pinchSheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.14"/>
+      <stop offset="0.45" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Big Sur-style squircle: 824x824 inset on a 1024 canvas. -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#pinchBg)"/>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#pinchSheen)"/>
+
+  <!-- Each half is ONE connected object — fingertip, straight shaft,
+       arrowhead — so the pair reads as two things converging. Bowed
+       shafts were tried first and read as rotation, not pinch. -->
+  <circle cx="299.9" cy="299.9" r="56" fill="#FFFFFF"/>
+  <circle cx="724.1" cy="724.1" r="56" fill="#FFFFFF"/>
+
+  <g stroke="#FFFFFF" stroke-width="30" stroke-linecap="round">
+    <line x1="329.6" y1="329.6" x2="405.9" y2="405.9"/>
+    <line x1="694.4" y1="694.4" x2="618.1" y2="618.1"/>
+  </g>
+
+  <!-- Arrowheads closing on the centre, with a clear gap between tips. -->
+  <g fill="#5AB2FF">
+    <path d="M471.0 471.0 L446.9 364.9 L364.9 446.9 Z"/>
+    <path d="M553.0 553.0 L577.1 659.1 L659.1 577.1 Z"/>
+  </g>
+</svg>

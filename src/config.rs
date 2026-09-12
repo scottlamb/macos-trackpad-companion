@@ -120,13 +120,23 @@ impl Default for Cursor {
 #[serde(deny_unknown_fields, default)]
 pub struct Scroll {
     pub sensitivity: f64,
+    /// Shape of the scroll-acceleration curve, matching
+    /// `cursor.accel_exponent`. 1.0 is linear; above it, fast scrolls
+    /// are amplified more than slow ones.
+    pub accel_exponent: f64,
+    /// Velocity (mm/s) at which `sensitivity` is the plain linear feel,
+    /// matching `cursor.accel_ref`.
+    pub accel_ref: f64,
     pub natural: bool,
 }
 
 impl Default for Scroll {
     fn default() -> Self {
+        let curve = crate::output::ScrollAccel::default();
         Self {
-            sensitivity: 20.0,
+            sensitivity: curve.px_per_mm_at_ref,
+            accel_exponent: curve.exponent,
+            accel_ref: curve.ref_mm_per_sec,
             natural: true,
         }
     }
@@ -215,18 +225,13 @@ pub enum SwipeBackend {
 /// can't kill its own gesture. Mirrors how macOS itself dispatches
 /// pinch/rotate/scroll/click — to the window under the cursor, not
 /// strictly the frontmost app.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum GestureEnable {
+    #[default]
     On,
     Off,
     Only(Vec<String>),
     Except(Vec<String>),
-}
-
-impl Default for GestureEnable {
-    fn default() -> Self {
-        Self::On
-    }
 }
 
 impl<'de> Deserialize<'de> for GestureEnable {

@@ -173,7 +173,7 @@ fn maybe_f32_bits(int_val: i64) -> Option<f32> {
         return None;
     }
     let abs = f.abs();
-    if abs < 1e-6 || abs > 1e6 {
+    if !(1e-6..=1e6).contains(&abs) {
         return None;
     }
     if f.fract() == 0.0 {
@@ -235,9 +235,7 @@ extern "C" fn callback(
     } else {
         " [offset preserved: post-dated]"
     };
-    println!(
-        "{label}{hid_str} ts={ts} Δ={delta_ms:+.3}ms{delta_tag}"
-    );
+    println!("{label}{hid_str} ts={ts} Δ={delta_ms:+.3}ms{delta_tag}");
 
     // Per-field detail. Walk a wide range so scroll-wheel fields (88,
     // 93–99) are covered alongside gesture fields (100–200). 0–250 is
@@ -316,9 +314,8 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    let mask = (1u64 << kCGSEventGesture)
-        | (1u64 << kCGSEventDockControl)
-        | (1u64 << kCGEventScrollWheel);
+    let mask =
+        (1u64 << kCGSEventGesture) | (1u64 << kCGSEventDockControl) | (1u64 << kCGEventScrollWheel);
     let tap = unsafe {
         CGEventTapCreate(
             kCGSessionEventTap,

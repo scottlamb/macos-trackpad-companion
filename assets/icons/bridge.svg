@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img" aria-label="macos-trackpad-companion — pad to native cursor icon">
+  <defs>
+    <linearGradient id="bridgeBg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3A4049"/>
+      <stop offset="1" stop-color="#15181C"/>
+    </linearGradient>
+    <linearGradient id="bridgeSheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.14"/>
+      <stop offset="0.45" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bridgeBg)"/>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bridgeSheen)"/>
+
+  <!-- The foreign PTP pad. -->
+  <rect x="190" y="400" width="300" height="224" rx="44" fill="none" stroke="#FFFFFF" stroke-width="26"/>
+  <circle cx="282" cy="468" r="20" fill="#FFFFFF" fill-opacity="0.85"/>
+  <circle cx="398" cy="556" r="20" fill="#FFFFFF" fill-opacity="0.85"/>
+
+  <!-- Translation. -->
+  <path d="M550 452 L600 512 L550 572" fill="none" stroke="#5AB2FF" stroke-width="26"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Out the other side as a native macOS pointer. -->
+  <path transform="translate(650,390) scale(13)"
+        d="M0 0 L0 17.6 L4.6 13.2 L7.5 19.2 L10.6 17.8 L7.7 11.9 L13.6 11.7 Z"
+        fill="#FFFFFF"/>
+</svg>

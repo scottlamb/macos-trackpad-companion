@@ -74,6 +74,12 @@ pub struct ScanTimeClock {
     offsets: VecDeque<i64>,
 }
 
+impl Default for ScanTimeClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ScanTimeClock {
     pub fn new() -> Self {
         Self {
