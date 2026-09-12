@@ -220,3 +220,14 @@ on separate interfaces.
   Once the centroid moves, the distance changes by 4%, or the angle
   changes by 6°, that mode wins for the duration of the touch. The
   thresholds in `gesture.rs` may need tuning once we have hardware.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or
+  <http://opensource.org/licenses/MIT>)
+
+at your option.
